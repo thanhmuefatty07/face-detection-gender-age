@@ -10,5 +10,5 @@ echo Controls: Q = Quit, L = Lock Face, U = Unlock
 echo.
 
 REM Use system Python (works with PyTorch)
-python scripts/main.py --source 0 --track
+python scripts/main.py --source 0 --track --conf 0.6
 pause

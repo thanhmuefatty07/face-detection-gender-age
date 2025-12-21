@@ -54,9 +54,9 @@ python scripts/main.py --source 0 --track
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `--source` | 0 | Camera ID or video path |
-| `--conf` | 0.7 | Detection confidence threshold |
+| `--conf` | 0.6 | Detection confidence threshold (0.6 optimal) |
 | `--track` | False | Enable face tracking |
-| `--device` | HYBRID | HYBRID, AUTO, CPU, GPU |
+| `--device` | HYBRID | AMD, HYBRID, AUTO, CPU, GPU |
 | `--max-faces` | 3 | Maximum faces to track |
 
 ## ⌨️ Controls
