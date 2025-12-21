@@ -17,9 +17,9 @@ html_content = """
             @bottom-center { content: counter(page); }
         }
         body {
-            font-family: 'Segoe UI', Arial, sans-serif;
+            font-family: 'Segoe UI', 'Roboto', Arial, sans-serif;
             font-size: 11pt;
-            line-height: 1.6;
+            line-height: 1.7;
             color: #333;
         }
         h1 { font-size: 22pt; color: #1a1a2e; text-align: center; margin-top: 0; }
@@ -30,9 +30,9 @@ html_content = """
         th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
         th { background: #667eea; color: white; }
         tr:nth-child(even) { background: #f8f9ff; }
-        code { background: #f0f4ff; padding: 2px 6px; border-radius: 3px; font-size: 9pt; }
-        pre { background: #1a1a2e; color: #e0e0e0; padding: 15px; border-radius: 5px; font-size: 8pt; overflow-x: auto; }
-        .title-page { text-align: center; page-break-after: always; padding-top: 100px; }
+        code { background: #f0f4ff; padding: 2px 6px; border-radius: 3px; font-size: 9pt; font-family: 'Consolas', 'Monaco', monospace; }
+        pre { background: #1a1a2e; color: #e0e0e0; padding: 15px; border-radius: 5px; font-size: 8pt; overflow-x: auto; font-family: 'Consolas', 'Monaco', monospace; }
+        .title-page { text-align: center; page-break-after: always; padding-top: 80px; }
         .title-page h1 { font-size: 28pt; margin-bottom: 10px; }
         .abstract { background: #f0f4ff; padding: 20px; border-left: 4px solid #667eea; margin: 20px 0; }
         .note { background: #fff3cd; padding: 10px 15px; border-left: 4px solid #ffc107; margin: 15px 0; }
@@ -43,7 +43,21 @@ html_content = """
         .toc { margin: 20px 0; }
         .toc a { text-decoration: none; color: #333; }
         .toc li { margin: 8px 0; }
-        .formula { background: #f8f9ff; padding: 15px; margin: 15px 0; text-align: center; font-style: italic; }
+        .formula { 
+            background: linear-gradient(135deg, #f8f9ff 0%, #eef2ff 100%); 
+            padding: 18px 25px; 
+            margin: 18px 0; 
+            text-align: center; 
+            font-family: 'Cambria Math', 'Times New Roman', Georgia, serif;
+            font-size: 12pt;
+            font-style: normal;
+            border: 1px solid #e0e5ff;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(102, 126, 234, 0.1);
+        }
+        .formula .var { font-style: italic; color: #1a1a2e; }
+        .formula .op { color: #667eea; font-weight: bold; }
+        .formula sub, .formula sup { font-size: 0.75em; }
         .comparison { display: flex; gap: 20px; }
         .comparison > div { flex: 1; }
     </style>
@@ -68,11 +82,13 @@ html_content = """
             <li>Phạm Văn Thanh - 104240479</li>
             <li>Huỳnh Minh Đức - 104240434</li>
             <li>Hồ Tâm Nguyên - 104240573</li>
+            <li>Lê Sỹ Hiếu - 104240169</li>
+            <li>Hoàng Đào Ngọc Minh - 1042315</li>
         </ul>
     </div>
     
-    <p style="margin-top: 60px;"><strong>Course:</strong> Introduction to Computer Science</p>
-    <p style="margin-top: 40px; color: #666;">December 2024</p>
+    <p style="margin-top: 50px;"><strong>Course:</strong> Introduction to Computer Science</p>
+    <p style="margin-top: 30px; color: #666;">21 December 2024</p>
 </div>
 
 <!-- TABLE OF CONTENTS -->
@@ -267,7 +283,7 @@ html_content = """
 <p><strong>DEX (Deep EXpectation) [7]:</strong> Rothe et al. formulated age estimation as a classification problem followed by expected value calculation:</p>
 
 <div class="formula">
-Age = Σ (class_probability[i] × central_age[i]) for i = 0 to N-1
+<strong>Age</strong> = Σ<sub>i=0</sub><sup>N-1</sup> ( P<sub>i</sub> × age<sub>i</sub> )
 </div>
 
 <p>This achieved 3.25 years MAE on MORPH-II dataset.</p>
@@ -288,7 +304,7 @@ Age = Σ (class_probability[i] × central_age[i]) for i = 0 to N-1
 
 <p><strong>Mathematical Formulation:</strong></p>
 <div class="formula">
-L_KD = α × T² × KL(softmax(z_s/T), softmax(z_t/T)) + (1-α) × CrossEntropy(y_s, y_true)
+ℒ<sub>KD</sub> = α · T² · KL( softmax(<em>z<sub>s</sub></em>/T), softmax(<em>z<sub>t</sub></em>/T) ) + (1-α) · CE(<em>y<sub>s</sub></em>, <em>y<sub>true</sub></em>)
 </div>
 
 <p>Where:</p>
@@ -308,7 +324,7 @@ L_KD = α × T² × KL(softmax(z_s/T), softmax(z_t/T)) + (1-α) × CrossEntropy(
 
 <p>The Gaussian distribution is computed as:</p>
 <div class="formula">
-d[k] = exp(-0.5 × ((k - μ) / σ)²) / Z
+<em>d</em>[<em>k</em>] = exp( -0.5 × ((<em>k</em> - μ) / σ)² ) / Z
 </div>
 
 <p>Where μ is the true age group, σ controls spread (we use σ=1.5), and Z normalizes the distribution.</p>
