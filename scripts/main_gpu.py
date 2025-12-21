@@ -38,11 +38,11 @@ AGE_GROUPS = ['0-2', '3-6', '7-12', '13-17', '18-24', '25-34', '35-44', '45-54',
 GENDERS = ['Male', 'Female']
 COLORS = {'Male': (255, 150, 50), 'Female': (180, 105, 255), 'Locked': (0, 255, 0)}
 
-# Validation
-MIN_FACE_SIZE = 50
-MIN_CLASSIFY_SIZE = 60
-MAX_ASPECT_RATIO = 1.8
-MIN_ASPECT_RATIO = 0.55
+# Validation - Tighter thresholds for higher accuracy
+MIN_FACE_SIZE = 60
+MIN_CLASSIFY_SIZE = 80  # Larger face = better accuracy
+MAX_ASPECT_RATIO = 1.6
+MIN_ASPECT_RATIO = 0.6
 
 
 class ChannelAttention(nn.Module):
@@ -244,9 +244,20 @@ def should_classify(x1, y1, x2, y2):
 
 
 def preprocess_face(face_bgr, img_size=160):
-    """Preprocess face for inference"""
-    face = cv2.resize(face_bgr, (img_size, img_size))
+    """Preprocess face for inference with enhanced quality"""
+    # Resize first
+    face = cv2.resize(face_bgr, (img_size, img_size), interpolation=cv2.INTER_LANCZOS4)
+    
+    # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) for better lighting
+    lab = cv2.cvtColor(face, cv2.COLOR_BGR2LAB)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    lab[:, :, 0] = clahe.apply(lab[:, :, 0])
+    face = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+    
+    # Convert to RGB
     face = cv2.cvtColor(face, cv2.COLOR_BGR2RGB)
+    
+    # Normalize with ImageNet stats
     face = face.astype(np.float32) / 255.0
     face = (face - np.array([0.485, 0.456, 0.406])) / np.array([0.229, 0.224, 0.225])
     face = face.transpose(2, 0, 1)  # HWC to CHW
