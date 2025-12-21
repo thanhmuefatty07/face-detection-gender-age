@@ -8,37 +8,75 @@ echo ========================================
 echo.
 echo Detecting GPU type...
 
+:: Detect GPU type
+set GPU_TYPE=NONE
+set DEVICE=CPU
+
 :: Check for AMD GPU
-wmic path win32_videocontroller get name | findstr /i "AMD Radeon" >nul
+wmic path win32_videocontroller get name 2>nul | findstr /i "AMD Radeon" >nul
 if %errorlevel%==0 (
-    echo [AMD GPU Detected] Using DirectML acceleration
-    set GPU_BACKEND=AMD
+    set GPU_TYPE=AMD
+    set DEVICE=AMD
+    echo [AMD GPU Detected]
+    goto :run
+)
+
+:: Check for Intel GPU  
+wmic path win32_videocontroller get name 2>nul | findstr /i "Intel" >nul
+if %errorlevel%==0 (
+    set GPU_TYPE=INTEL
+    set DEVICE=HYBRID
+    echo [Intel GPU Detected]
+    goto :run
+)
+
+:: No GPU found
+echo [No compatible GPU] Using CPU mode
+set GPU_TYPE=CPU
+set DEVICE=CPU
+
+:run
+echo.
+echo ========================================
+echo   Configuration:
+echo   - GPU Type: %GPU_TYPE%
+echo   - Device Mode: %DEVICE%
+echo   - Confidence: 0.6 (optimal)
+echo ========================================
+echo.
+echo Controls:
+echo   Q = Quit
+echo   L = Lock Face (tracking)
+echo   U = Unlock
+echo   T = Toggle tracking
+echo.
+
+:: Run the application
+if "%GPU_TYPE%"=="AMD" (
+    echo Starting with AMD DirectML acceleration...
+    echo Note: Requires onnxruntime-directml
+    echo       Install: pip install onnxruntime-directml
+    echo.
+    python scripts/main_gpu.py --source 0 --track --device AMD --conf 0.6
+) else if "%GPU_TYPE%"=="INTEL" (
+    echo Starting with Intel OpenVINO HYBRID mode...
+    python scripts/main_gpu.py --source 0 --track --device HYBRID --conf 0.6
 ) else (
-    :: Check for Intel GPU
-    wmic path win32_videocontroller get name | findstr /i "Intel" >nul
-    if %errorlevel%==0 (
-        echo [Intel GPU Detected] Using OpenVINO HYBRID mode
-        set GPU_BACKEND=INTEL
-    ) else (
-        echo [No compatible GPU] Using CPU mode
-        set GPU_BACKEND=CPU
-    )
+    echo Starting with CPU mode...
+    python scripts/main_gpu.py --source 0 --track --device CPU --conf 0.6
 )
 
 echo.
-echo Controls: Q = Quit, L = Lock Face, U = Unlock
-echo.
-
-:: Run based on detected GPU
-if "%GPU_BACKEND%"=="AMD" (
-    python scripts/main_gpu.py --source 0 --track --device CPU --conf 0.7
+if %errorlevel% neq 0 (
+    echo ========================================
+    echo   ERROR: Application crashed!
+    echo ========================================
     echo.
-    echo Note: AMD GPUs use CPU mode with optimized settings.
-    echo For better AMD support, install: pip install onnxruntime-directml
-) else if "%GPU_BACKEND%"=="INTEL" (
-    python scripts/main_gpu.py --source 0 --track --device HYBRID --conf 0.7
-) else (
-    python scripts/main_gpu.py --source 0 --track --device CPU --conf 0.7
+    if "%GPU_TYPE%"=="AMD" (
+        echo For AMD GPU support, install DirectML:
+        echo   pip install onnxruntime-directml
+        echo.
+    )
 )
 
 pause

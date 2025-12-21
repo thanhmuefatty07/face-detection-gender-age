@@ -29,6 +29,18 @@ except ImportError:
     HAS_OPENVINO = False
     print("⚠️ OpenVINO not installed, using PyTorch fallback")
 
+# Try importing DirectML for AMD GPUs
+try:
+    import onnxruntime as ort
+    # Check if DirectML is available
+    providers = ort.get_available_providers()
+    HAS_DIRECTML = 'DmlExecutionProvider' in providers
+    if HAS_DIRECTML:
+        print("✅ DirectML available for AMD GPU acceleration")
+except ImportError:
+    HAS_DIRECTML = False
+    ort = None
+
 # Config
 FACE_MODEL = "models/yolov11s-face.pt"
 PYTORCH_MODEL = Path(__file__).parent.parent / "models/best_model.pth"
@@ -352,8 +364,53 @@ class OpenVINOModel:
         return gender.copy(), age.copy()
 
 
+class DirectMLModel:
+    """DirectML model wrapper for AMD GPU acceleration
+    
+    Uses ONNX Runtime with DirectML Execution Provider for AMD GPUs.
+    Requires: pip install onnxruntime-directml
+    """
+    
+    def __init__(self, model_path):
+        if not HAS_DIRECTML:
+            raise RuntimeError("DirectML not available. Install: pip install onnxruntime-directml")
+        
+        print(f"🚀 Loading model with DirectML (AMD GPU)...")
+        
+        # Create session with DirectML provider
+        sess_options = ort.SessionOptions()
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        
+        self.session = ort.InferenceSession(
+            str(model_path),
+            sess_options,
+            providers=['DmlExecutionProvider', 'CPUExecutionProvider']
+        )
+        
+        # Get actual provider being used
+        active_provider = self.session.get_providers()[0]
+        if active_provider == 'DmlExecutionProvider':
+            self.device_display = 'AMD GPU (DirectML)'
+            print(f"✅ Running on AMD GPU with DirectML")
+        else:
+            self.device_display = 'CPU (DirectML fallback)'
+            print(f"⚠️ DirectML unavailable, using CPU")
+        
+        self.input_name = self.session.get_inputs()[0].name
+    
+    def __call__(self, input_tensor):
+        """Run inference"""
+        outputs = self.session.run(None, {self.input_name: input_tensor})
+        return outputs[0], outputs[1]
+
+
 def load_models(img_size=160, device='AUTO'):
-    """Load face detection and gender/age models"""
+    """Load face detection and gender/age models
+    
+    Args:
+        img_size: Input image size for gender/age model
+        device: Device to use - AUTO, CPU, GPU, HYBRID, or AMD
+    """
     
     # Face model (YOLO)
     model_path = Path(__file__).parent.parent / FACE_MODEL
@@ -371,28 +428,35 @@ def load_models(img_size=160, device='AUTO'):
     ga_model = None
     model_device = "CPU"  # Default
     
-    if HAS_OPENVINO:
-        # Try OpenVINO first
-        if not ONNX_MODEL.exists():
-            # Export from PyTorch to ONNX first
-            if PYTORCH_MODEL.exists():
-                print(f"🔄 Exporting PyTorch model to ONNX...")
-                try:
-                    checkpoint = torch.load(PYTORCH_MODEL, map_location='cpu')
-                    pytorch_model = GenderAgeStudent(backbone='mobilenetv3_large_100', num_ages=10)
-                    pytorch_model.load_state_dict(checkpoint['model_state_dict'])
-                    pytorch_model.eval()
-                    export_to_onnx(pytorch_model, ONNX_MODEL, img_size)
-                except Exception as e:
-                    print(f"❌ Error exporting to ONNX: {e}")
-        
-        if ONNX_MODEL.exists():
-            try:
-                print(f"🚀 Loading model with OpenVINO...")
-                ga_model = OpenVINOModel(str(ONNX_MODEL), device)
-                model_device = ga_model.device_display
-            except Exception as e:
-                print(f"❌ Error loading OpenVINO model: {e}")
+    # Ensure ONNX model exists (needed for both DirectML and OpenVINO)
+    if not ONNX_MODEL.exists() and PYTORCH_MODEL.exists():
+        print(f"🔄 Exporting PyTorch model to ONNX...")
+        try:
+            checkpoint = torch.load(PYTORCH_MODEL, map_location='cpu')
+            pytorch_model = GenderAgeStudent(backbone='mobilenetv3_large_100', num_ages=10)
+            pytorch_model.load_state_dict(checkpoint['model_state_dict'])
+            pytorch_model.eval()
+            export_to_onnx(pytorch_model, ONNX_MODEL, img_size)
+        except Exception as e:
+            print(f"❌ Error exporting to ONNX: {e}")
+    
+    # Try AMD DirectML first (if requested or auto-detected)
+    if device == 'AMD' and HAS_DIRECTML and ONNX_MODEL.exists():
+        try:
+            ga_model = DirectMLModel(str(ONNX_MODEL))
+            model_device = ga_model.device_display
+        except Exception as e:
+            print(f"❌ Error loading DirectML model: {e}")
+            ga_model = None
+    
+    # Try OpenVINO (for Intel or as fallback)
+    if ga_model is None and HAS_OPENVINO and ONNX_MODEL.exists():
+        try:
+            print(f"🚀 Loading model with OpenVINO...")
+            ga_model = OpenVINOModel(str(ONNX_MODEL), device)
+            model_device = ga_model.device_display
+        except Exception as e:
+            print(f"❌ Error loading OpenVINO model: {e}")
     
     # Fallback to PyTorch
     if ga_model is None and PYTORCH_MODEL.exists():
