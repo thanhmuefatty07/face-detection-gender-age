@@ -296,7 +296,7 @@ def open_camera(source, width, height):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--source', default='0', help='Camera ID')
-    parser.add_argument('--conf', type=float, default=0.7, help='Confidence')
+    parser.add_argument('--conf', type=float, default=0.6, help='Confidence threshold (0.6 optimal)')
     parser.add_argument('--track', action='store_true', help='Enable tracking')
     parser.add_argument('--skip', type=int, default=5, help='Process every N frames (Higher=Faster)')
     parser.add_argument('--max-faces', type=int, default=3, help='Max faces')
