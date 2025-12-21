@@ -1,30 +1,26 @@
-"""Script to FIX existing train_with_visualizations.ipynb"""
+"""
+Sync train_with_visualizations.ipynb from train_optimized.ipynb
+Ensures 100% accuracy for report by copying training sections exactly
+and adding only approved visualization sections.
+"""
 import json
 
-# Read current notebook
-with open('notebooks/train_with_visualizations.ipynb', 'r', encoding='utf-8') as f:
-    nb = json.load(f)
+print("Reading original train_optimized.ipynb...")
+with open('notebooks/train_optimized.ipynb', 'r', encoding='utf-8') as f:
+    original = json.load(f)
 
-print(f"Current notebook has {len(nb['cells'])} cells")
+print(f"Original has {len(original['cells'])} cells")
 
-# Remove old visualization cells (from Section 14 onwards) and replace with fixed ones
-# Find the index where Section 14 starts
-section_14_idx = None
-for i, cell in enumerate(nb['cells']):
-    if cell['cell_type'] == 'markdown':
-        source = ''.join(cell['source'])
-        if '## 14' in source:
-            section_14_idx = i
-            break
+# Copy all original cells
+new_nb = {
+    'cells': original['cells'].copy(),
+    'metadata': original['metadata'].copy(),
+    'nbformat': original['nbformat'],
+    'nbformat_minor': original['nbformat_minor']
+}
 
-if section_14_idx:
-    print(f"Found Section 14 at index {section_14_idx}")
-    # Remove all cells from Section 14 onwards
-    nb['cells'] = nb['cells'][:section_14_idx]
-    print(f"Trimmed to {len(nb['cells'])} cells")
-
-# Fix pip install cell to include seaborn and sklearn
-for cell in nb['cells']:
+# Fix pip install to include seaborn and sklearn (required for visualizations)
+for cell in new_nb['cells']:
     if cell['cell_type'] == 'code':
         source = ''.join(cell['source'])
         if '!pip install' in source and 'timm' in source:
@@ -32,11 +28,11 @@ for cell in nb['cells']:
                 "# Install required packages\n",
                 "!pip install -q timm albumentations onnx onnxruntime seaborn scikit-learn"
             ]
-            print("Fixed pip install cell")
+            print("Added seaborn and sklearn to pip install")
             break
 
-# Add FIXED visualization cells
-new_cells = [
+# Add visualization sections that use data from training
+visualization_cells = [
     {'cell_type': 'markdown', 'metadata': {}, 'source': ['## 14. Confusion Matrix Visualization']},
     {'cell_type': 'code', 'execution_count': None, 'metadata': {}, 'outputs': [], 'source': [
         'import seaborn as sns\n',
@@ -248,9 +244,18 @@ new_cells = [
     ]}
 ]
 
-nb['cells'].extend(new_cells)
+new_nb['cells'].extend(visualization_cells)
 
+# Save
 with open('notebooks/train_with_visualizations.ipynb', 'w', encoding='utf-8') as f:
-    json.dump(nb, f, indent=2, ensure_ascii=False)
+    json.dump(new_nb, f, indent=2, ensure_ascii=False)
 
-print(f"\n✅ Fixed notebook saved with {len(nb['cells'])} cells")
+print(f"\n✅ Synced train_with_visualizations.ipynb")
+print(f"   Training sections: {len(original['cells'])} cells (from original)")
+print(f"   Visualization sections: {len(visualization_cells)} cells (added)")
+print(f"   Total: {len(new_nb['cells'])} cells")
+print("\n📊 REQUIRED DATASETS ON KAGGLE:")
+print("   1. utkface-new - UTKFace dataset for training")
+print("      Path: /kaggle/input/utkface-new/UTKFace")
+print("   2. gender-age-model - Teacher model checkpoint")
+print("      Path: /kaggle/input/gender-age-model/gender_age_model.pth")
