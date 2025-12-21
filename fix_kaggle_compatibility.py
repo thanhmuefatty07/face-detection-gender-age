@@ -1,10 +1,10 @@
 """
-Fix compatibility issue for Kaggle notebooks.
-Updates pip install to use compatible versions of numpy, scipy, albumentations.
+Fix Kaggle compatibility by proper installation order.
+Must reinstall sklearn AFTER numpy to fix binary compatibility.
 """
 import json
 
-print("Fixing compatibility issues in notebooks...")
+print("Fixing Kaggle compatibility with proper install order...")
 
 # Fix both notebooks
 for notebook_file in ['notebooks/train_optimized.ipynb', 'notebooks/train_with_visualizations.ipynb']:
@@ -15,15 +15,18 @@ for notebook_file in ['notebooks/train_optimized.ipynb', 'notebooks/train_with_v
     for cell in nb['cells']:
         if cell['cell_type'] == 'code':
             source = ''.join(cell['source'])
-            if '!pip install' in source and 'albumentations' in source:
-                # Fix: Downgrade albumentations to compatible version, fix scipy
+            if '!pip install' in source and ('albumentations' in source or 'numpy' in source):
+                # Fix: Use --force-reinstall for sklearn after numpy change
                 cell['source'] = [
-                    "# Install required packages with compatible versions\n",
-                    "# Note: albumentations 1.3.x is more stable on Kaggle\n",
-                    "!pip install -q numpy==1.24.3\n",
-                    "!pip install -q scipy==1.11.4\n", 
-                    "!pip install -q albumentations==1.3.1\n",
-                    "!pip install -q timm onnx onnxruntime seaborn scikit-learn"
+                    "# Install packages with proper order to avoid binary incompatibility\n",
+                    "# Step 1: Upgrade numpy first\n",
+                    "!pip install -q --upgrade numpy\n",
+                    "\n",
+                    "# Step 2: Force reinstall sklearn to match new numpy\n",
+                    "!pip install -q --force-reinstall scikit-learn\n",
+                    "\n",
+                    "# Step 3: Install other packages\n",
+                    "!pip install -q timm albumentations onnx onnxruntime seaborn"
                 ]
                 fixed = True
                 break
@@ -35,7 +38,8 @@ for notebook_file in ['notebooks/train_optimized.ipynb', 'notebooks/train_with_v
     else:
         print(f"  - {notebook_file} (no changes needed)")
 
-print("\n✅ Fixed version compatibility!")
-print("   numpy==1.24.3")
-print("   scipy==1.11.4") 
-print("   albumentations==1.3.1")
+print("\n✅ Fixed installation order!")
+print("   1. Upgrade numpy first")
+print("   2. Force reinstall scikit-learn (fixes binary compatibility)")
+print("   3. Install other packages")
+print("\n⚠️ IMPORTANT: After running Step 1 & 2, RESTART KERNEL before importing!")
