@@ -1,0 +1,17 @@
+{
+  "id": "vnthanhphm/face-dataset-mining-extreme-filtering",
+  "title": "Face Dataset Mining & Extreme Filtering Pipeline",
+  "code_file": "kaggle_face_mining_pipeline.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "dataset_sources": [
+    "vnthanhphm/face-gender-age-sota-benchmark-v6",
+    "vnthanhphm/appa-real-age-only-v1"
+  ],
+  "competition_sources": [],
+  "kernel_sources": []
+}
