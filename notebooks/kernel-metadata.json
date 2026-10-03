@@ -11,10 +11,11 @@
   "dataset_sources": [
     "vnthanhphm/face-gender-age-sota-benchmark-v6",
     "vnthanhphm/appa-real-age-only-v1",
-    "jovian/fairface-dataset",
+    "ghaidaalatoum/fairface",
     "jessicali9530/celeba-dataset",
-    "dimitrisk/imdb-wiki-dataset",
-    "yueyue/afad-lite"
+    "yuulind/imdb-clean",
+    "lyk1652/afad-full",
+    "moritzm00/biometrically-filtered-famous-figure-dataset"
   ],
   "competition_sources": [],
   "kernel_sources": []

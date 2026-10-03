@@ -62,9 +62,10 @@ def generate_pipeline_notebook(output_path: Path):
                 "import numpy as np\n",
                 "import pandas as pd\n",
                 "import torch\n",
-                "print(f'[Env] PyTorch {torch.__version__} | OpenCV {cv2.__version__} | CUDA Available: {torch.cuda.is_available()}')\n",
-                "if torch.cuda.is_available():\n",
-                "    print(f'[Env] Active GPU Accelerator: {torch.cuda.get_device_name(0)}')\n"
+                "num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0\n",
+                "print(f'[Env] PyTorch {torch.__version__} | OpenCV {cv2.__version__} | Active GPUs: {num_gpus}')\n",
+                "for g in range(num_gpus):\n",
+                "    print(f'  [GPU {g}] {torch.cuda.get_device_name(g)} | VRAM: {torch.cuda.get_device_properties(g).total_memory / (1024**3):.1f} GB')\n"
             ]
         },
         # Cell 2: Multi-Source Dataset Connectors & Quota Manager (M1)
@@ -381,9 +382,9 @@ def generate_pipeline_notebook(output_path: Path):
                 "    for p in input_base.rglob('*.*'):\n",
                 "        if p.suffix.lower() in ['.jpg', '.jpeg', '.png', '.webp']:\n",
                 "            candidate_files.append(p)\n",
-                "            if len(candidate_files) >= 20000:\n",
+                "            if len(candidate_files) >= 250000:\n",
                 "                break\n",
-                "print(f'[Pipeline] Discovered {len(candidate_files)} image candidates.')\n",
+                "print(f'[Pipeline] Discovered {len(candidate_files)} image candidates across all mounted inputs.')\n",
                 "\n",
                 "for idx, img_path in enumerate(candidate_files):\n",
                 "    if curated_count >= MAX_CURATED:\n",
