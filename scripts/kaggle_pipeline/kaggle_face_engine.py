@@ -485,11 +485,12 @@ class ExtremeQualityAuditor:
         yaw, pitch, roll = 0.0, 0.0, 0.0
         if landmarks_5 is not None:
             yaw, pitch, roll = self.estimate_head_pose(landmarks_5, w, h)
-            if abs(yaw) > self.max_abs_yaw:
+            eps = 1e-4
+            if abs(yaw) - self.max_abs_yaw > eps:
                 rejection_reasons.append(f"EXCESSIVE_YAW (|{yaw:.1f}°| > {self.max_abs_yaw}°)")
-            if abs(pitch) > self.max_abs_pitch:
+            if abs(pitch) - self.max_abs_pitch > eps:
                 rejection_reasons.append(f"EXCESSIVE_PITCH (|{pitch:.1f}°| > {self.max_abs_pitch}°)")
-            if abs(roll) > self.max_abs_roll:
+            if abs(roll) - self.max_abs_roll > eps:
                 rejection_reasons.append(f"EXCESSIVE_ROLL (|{roll:.1f}°| > {self.max_abs_roll}°)")
 
             # 4. Bilateral Cheek Occlusion

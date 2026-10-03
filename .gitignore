@@ -13,6 +13,7 @@ reports/kaggle_output/
 .agents/
 .hypothesis/
 .pytest_cache/
+.benchmarks/
 
 # Virtual environments
 .venv/
