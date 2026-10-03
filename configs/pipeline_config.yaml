@@ -1,0 +1,157 @@
+# Pipeline Configuration for Kaggle Face Mining, Morphometry & Extreme Filtering
+# Project: Face Detection, Gender/Age & Biological Morphometry Pipeline
+
+environment:
+  runtime: "kaggle_cloud_gpu"
+  kaggle_input_dir: "/kaggle/input"
+  kaggle_working_dir: "/kaggle/working"
+  local_reports_dir: "reports"
+  random_seed: 42
+
+ingestion:
+  max_samples_per_dataset: 50000
+  supported_extensions: [".jpg", ".jpeg", ".png", ".webp", ".bmp"]
+  datasets:
+    fairface:
+      kaggle_slug: "jovian/fairface-dataset"
+      archive_names: ["fairface-img-margin025.zip", "fairface-img-margin125.zip"]
+      labels: ["fairface_label_train.csv", "fairface_label_val.csv"]
+    celeba:
+      kaggle_slug: "jessicali9530/celeba-dataset"
+      archive_name: "img_align_celeba.zip"
+      landmarks_file: "list_landmarks_align_celeba.txt"
+      attributes_file: "list_attr_celeba.txt"
+      partition_file: "list_eval_partition.txt"
+    imdb_wiki:
+      kaggle_slug: "dimitrisk/imdb-wiki-dataset"
+      mat_files: ["imdb.mat", "wiki.mat"]
+      tar_files: ["imdb_crop.tar", "wiki_crop.tar"]
+      min_face_score: 1.0
+      max_second_face_score: 0.5
+    afad:
+      kaggle_slug: "yueyue/afad-lite"
+      root_folder: "AFAD-Full"
+      min_age: 15
+      max_age: 40
+    b3fd:
+      kaggle_slug: "moritzm00/biometrically-filtered-famous-figure-dataset"
+      metadata_file: "b3fd_metadata.csv"
+    appa_real:
+      kaggle_slug: "vnthanhphm/appa-real-age-only-v1"
+      metadata_files: ["gt_avg_train.csv", "gt_avg_valid.csv", "gt_avg_test.csv"]
+
+crawler:
+  enabled: true
+  max_queries: 220
+  images_per_query: 20
+  max_workers: 8
+  request_timeout_sec: 10
+  rate_limit_delay_sec: 0.25
+  max_retries: 3
+  backoff_factor: 1.5
+  output_subfolder: "web_crawled"
+
+quota_manager:
+  max_working_gb: 18.0
+  warning_working_gb: 15.0
+  min_free_gb: 2.0
+  shard_image_count: 5000
+  shard_archive_format: "tar"
+  jpeg_quality: 95
+
+quality_filtering:
+  target_resolution: 160
+  min_face_size: 112
+  min_laplacian_var: 100.0
+  min_tenengrad: 250.0
+  max_abs_yaw_deg: 35.0
+  max_abs_pitch_deg: 25.0
+  max_abs_roll_deg: 20.0
+  min_luminance_l: 35.0
+  max_luminance_l: 220.0
+  max_clipping_fraction: 0.08
+  max_cheek_delta_e: 22.0
+  min_landmark_confidence: 0.65
+
+deduplication:
+  phash_hamming_threshold: 6
+  cosine_distance_threshold: 0.35
+  cross_split_hamming_min: 7
+
+morphometry_ldl:
+  age_cohorts:
+    - name: "0-2"
+      low: 0.0
+      high: 2.5
+      center: 1.0
+    - name: "3-6"
+      low: 2.5
+      high: 6.5
+      center: 4.5
+    - name: "7-12"
+      low: 6.5
+      high: 12.5
+      center: 9.5
+    - name: "13-17"
+      low: 12.5
+      high: 17.5
+      center: 15.0
+    - name: "18-24"
+      low: 17.5
+      high: 24.5
+      center: 21.0
+    - name: "25-34"
+      low: 24.5
+      high: 34.5
+      center: 29.5
+    - name: "35-44"
+      low: 34.5
+      high: 44.5
+      center: 39.5
+    - name: "45-54"
+      low: 44.5
+      high: 54.5
+      center: 49.5
+    - name: "55-64"
+      low: 54.5
+      high: 64.5
+      center: 59.5
+    - name: "65+"
+      low: 64.5
+      high: 100.0
+      center: 72.0
+  dimorphism:
+    w_min: 0.25
+    alpha: 1.0
+    beta: 0.15
+    sigma_0: 0.05
+    sigma_max: 0.45
+    gamma_1: 1.20
+    gamma_2: 1.35
+  ethnic_aging:
+    east_asian_cliff_age: 48.0
+    east_asian_delta_youth: 4.5
+    east_asian_kappa_cliff: 1.30
+    caucasian_photo_factor: 1.05
+    black_photoprotection_offset: -3.5
+    south_asian_tear_trough_offset: 2.5
+  ldl_integration:
+    default_sigma_min: 2.0
+    lambda_age: 0.85
+    alpha_emd: 0.50
+
+multi_teacher:
+  teachers: ["InsightFace_ArcFace", "MiVOLO", "FairFace", "CLIP"]
+  max_epistemic_age_std: 8.0
+  max_child_epistemic_age_std: 5.5
+  min_adult_gender_confidence: 0.70
+  max_adult_gender_std: 0.35
+  max_clip_contradiction_margin: 0.35
+
+export_packaging:
+  owner: "vnthanhphm"
+  dataset_slug: "face-gender-age-golden-dataset"
+  dataset_title: "Face Gender Age Biological SOTA Dataset"
+  license: "CC0-1.0"
+  manifest_parquet: "metadata.parquet"
+  manifest_csv: "metadata.csv"

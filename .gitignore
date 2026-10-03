@@ -7,6 +7,13 @@
 # Dataset - DO NOT UPLOAD (too large ~16k files)
 images/
 labels/
+reports/kaggle_output/golden_dataset/images/
+reports/kaggle_output/*/images/
+*.jpg
+*.jpeg
+.agents/
+.hypothesis/
+.pytest_cache/
 
 # Virtual environments
 .venv/

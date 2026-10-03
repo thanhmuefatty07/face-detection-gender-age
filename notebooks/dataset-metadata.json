@@ -1,0 +1,19 @@
+{
+  "title": "Face Gender Age Biological SOTA Dataset",
+  "id": "vnthanhphm/face-gender-age-golden-dataset",
+  "licenses": [
+    {
+      "name": "CC0-1.0"
+    }
+  ],
+  "keywords": [
+    "biometrics",
+    "face-detection",
+    "age-estimation",
+    "gender-classification",
+    "label-distribution-learning",
+    "extreme-filtering",
+    "alpha-signals"
+  ],
+  "description": "Golden biometric face dataset curated via In-Cloud Extreme Filtering, 5-point landmark similarity alignment, Label Distribution Learning (LDL), and epistemic noise removal."
+}

@@ -10,7 +10,11 @@
   "enable_internet": true,
   "dataset_sources": [
     "vnthanhphm/face-gender-age-sota-benchmark-v6",
-    "vnthanhphm/appa-real-age-only-v1"
+    "vnthanhphm/appa-real-age-only-v1",
+    "jovian/fairface-dataset",
+    "jessicali9530/celeba-dataset",
+    "dimitrisk/imdb-wiki-dataset",
+    "yueyue/afad-lite"
   ],
   "competition_sources": [],
   "kernel_sources": []

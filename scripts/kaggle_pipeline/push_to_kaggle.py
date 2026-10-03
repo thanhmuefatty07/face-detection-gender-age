@@ -29,11 +29,11 @@ def main():
 
     print(f"✅ {out}")
 
-    kernel_id = "vnthanhphm/face-dataset-mining-extreme-filtering"
+    kernel_id = "vnthanhphm/face-dataset-mining-extreme-filtering-pipeline"
     print(f"⏳ Monitoring status for {kernel_id}...")
 
     if "--push-only" in sys.argv:
-        print("Done (push-only mode). Check status anytime using: kaggle kernels status vnthanhphm/face-dataset-mining-extreme-filtering")
+        print(f"Done (push-only mode). Check status anytime using: kaggle kernels status {kernel_id}")
         return
 
     for _ in range(60):
