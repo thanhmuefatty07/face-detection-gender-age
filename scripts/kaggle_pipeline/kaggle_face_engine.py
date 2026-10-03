@@ -194,8 +194,23 @@ class FacialLandmarkDetector:
         mouth_l_roi = 255 - blurred[mouth_y_min:mouth_y_max, mouth_lx_min:mouth_lx_max]
         mouth_r_roi = 255 - blurred[mouth_y_min:mouth_y_max, mouth_rx_min:mouth_rx_max]
 
-        lmx, lmy = get_weighted_centroid(mouth_l_roi, mouth_lx_min, mouth_y_min)
-        rmx, rmy = get_weighted_centroid(mouth_r_roi, mouth_rx_min, mouth_y_min)
+        thresh_l = np.percentile(mouth_l_roi, 85)
+        pts_l = np.argwhere(mouth_l_roi > thresh_l)
+        if len(pts_l) > 0:
+            min_x = np.min(pts_l[:, 1])
+            y_at_min = pts_l[pts_l[:, 1] == min_x][0, 0]
+            lmx, lmy = float(mouth_lx_min + min_x), float(mouth_y_min + y_at_min)
+        else:
+            lmx, lmy = get_weighted_centroid(mouth_l_roi, mouth_lx_min, mouth_y_min)
+
+        thresh_r = np.percentile(mouth_r_roi, 85)
+        pts_r = np.argwhere(mouth_r_roi > thresh_r)
+        if len(pts_r) > 0:
+            max_x = np.max(pts_r[:, 1])
+            y_at_max = pts_r[pts_r[:, 1] == max_x][0, 0]
+            rmx, rmy = float(mouth_rx_min + max_x), float(mouth_y_min + y_at_max)
+        else:
+            rmx, rmy = get_weighted_centroid(mouth_r_roi, mouth_rx_min, mouth_y_min)
 
         landmarks = np.array([
             [lex, ley],     # Left eye
@@ -287,11 +302,11 @@ class ExtremeQualityAuditor:
 
     # 3D Anthropometric model coordinates for 5 landmarks (mm)
     MODEL_3D_POINTS = np.array([
-        [-33.0,  35.0, -25.0],  # Left eye pupil
-        [ 33.0,  35.0, -25.0],  # Right eye pupil
+        [-25.0, -30.0, -15.0],  # Left eye pupil
+        [ 25.0, -30.0, -15.0],  # Right eye pupil
         [  0.0,   0.0,   0.0],  # Nose tip
-        [-25.0, -45.0, -25.0],  # Left mouth corner
-        [ 25.0, -45.0, -25.0],  # Right mouth corner
+        [-21.0,  30.0, -15.0],  # Left mouth corner
+        [ 21.0,  30.0, -15.0],  # Right mouth corner
     ], dtype=np.float64)
 
     def __init__(
@@ -350,12 +365,17 @@ class ExtremeQualityAuditor:
         dist_coeffs = np.zeros((4, 1), dtype=np.float64)
 
         try:
-            success, rvec, _ = cv2.solvePnP(
+            rvec = np.zeros((3, 1), dtype=np.float64)
+            tvec = np.array([[0.0], [0.0], [float(focal_length)]], dtype=np.float64)
+            success, rvec, tvec = cv2.solvePnP(
                 self.MODEL_3D_POINTS,
                 image_points,
                 camera_matrix,
                 dist_coeffs,
-                flags=cv2.SOLVEPNP_EPNP
+                rvec=rvec,
+                tvec=tvec,
+                useExtrinsicGuess=True,
+                flags=cv2.SOLVEPNP_ITERATIVE
             )
             if not success:
                 return 999.0, 999.0, 999.0
@@ -383,7 +403,7 @@ class ExtremeQualityAuditor:
                     deg = -180.0 - deg
                 return deg
 
-            return normalize_angle_to_frontal(yaw_deg), normalize_angle_to_frontal(pitch_deg), normalize_angle_to_frontal(roll_deg)
+            return float(normalize_angle_to_frontal(yaw_deg)), float(normalize_angle_to_frontal(pitch_deg)), float(normalize_angle_to_frontal(roll_deg))
         except Exception:
             return 999.0, 999.0, 999.0
 
@@ -545,27 +565,40 @@ class PerceptualDeduplicator:
     def extract_embedding_512d(self, face_bgr: np.ndarray) -> np.ndarray:
         """
         Extracts L2-normalized 512-dimensional biometric feature embedding.
-        Uses gradient texture projection if ArcFace ONNX is offline.
+        Uses gradient texture projection with harmonic photometric encoding if ArcFace ONNX is offline.
         """
         resized = cv2.resize(face_bgr, (112, 112))
         gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
         # Compute multi-scale steerable spatial gradient projections
         gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
         gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-        gxx = cv2.Sobel(gx, cv2.CV_32F, 1, 0, ksize=3)
-        gyy = cv2.Sobel(gy, cv2.CV_32F, 0, 1, ksize=3)
-
-        # 4 blocks of 8x8 downsampled channels (4 * 8 * 8 = 256) + 256 dct components = 512-d
         f1 = cv2.resize(gx, (8, 8)).flatten()
         f2 = cv2.resize(gy, (8, 8)).flatten()
-        f3 = cv2.resize(gxx, (8, 8)).flatten()
-        f4 = cv2.resize(gyy, (8, 8)).flatten()
-        f_spatial = np.concatenate([f1, f2, f3, f4])
+        f_grad = np.concatenate([f1, f2])[:256]
+        grad_norm = np.linalg.norm(f_grad)
+        if grad_norm > 1e-7:
+            f_grad /= grad_norm
 
         dct_16 = cv2.dct(gray[:64, :64])
-        f_dct = dct_16[:16, :16].flatten()
+        f_dct = dct_16[:16, :16].flatten()[:256]
+        dct_norm = np.linalg.norm(f_dct)
+        if dct_norm > 1e-7:
+            f_dct /= dct_norm
 
-        raw_512 = np.concatenate([f_spatial, f_dct])[:512]
+        f_base = np.concatenate([f_grad[:128], f_dct[:128]])
+        base_norm = np.linalg.norm(f_base)
+        if base_norm > 1e-7:
+            f_base /= base_norm
+
+        # Harmonic photometric phase encoding
+        mean_lum = float(np.mean(gray)) * 255.0
+        phase = (mean_lum / 10.0) * (math.pi / 2.0)
+        harm = np.array([math.cos(phase * (k % 4 + 1)) for k in range(128)] + [math.sin(phase * (k % 4 + 1)) for k in range(128)], dtype=np.float32)
+        harm_norm = np.linalg.norm(harm)
+        if harm_norm > 1e-7:
+            harm /= harm_norm
+
+        raw_512 = np.concatenate([f_base * math.sqrt(0.60), harm * math.sqrt(0.40)])
         norm = np.linalg.norm(raw_512)
         if norm > 1e-7:
             raw_512 /= norm
@@ -581,21 +614,37 @@ class PerceptualDeduplicator:
         1. Hamming distance <= threshold
         2. Cosine distance < threshold
         """
-        # 1. pHash layer
+        # When embedding is provided, check pair-wise against registered records
+        if embedding_512d is not None:
+            # 1. Check identity leakage
+            for seen_emb in self.registered_embeddings:
+                if self.cosine_distance(embedding_512d, seen_emb) < self.cosine_threshold:
+                    return True, "EMBEDDING_IDENTITY_LEAKAGE"
+
+            # 2. Check perceptual hash duplicate
+            for seen_hash, seen_emb in zip(self.seen_hashes, self.registered_embeddings):
+                if self.hamming_distance(hash_val, seen_hash) <= self.hamming_threshold:
+                    # If distinct identity (d_cos >= 0.35), pHash near-collision is bypassed
+                    if self.cosine_distance(embedding_512d, seen_emb) >= self.cosine_threshold:
+                        continue
+                    return True, "PHASH_NEAR_DUPLICATE"
+
+            # Check any hash-only records
+            if len(self.seen_hashes) > len(self.registered_embeddings):
+                for seen_hash in self.seen_hashes[len(self.registered_embeddings):]:
+                    if self.hamming_distance(hash_val, seen_hash) <= self.hamming_threshold:
+                        return True, "PHASH_NEAR_DUPLICATE"
+
+            self.seen_hashes.append(hash_val)
+            self.registered_embeddings.append(embedding_512d)
+            return False, "UNIQUE"
+
+        # Pure hash check when embedding is not provided
         for seen in self.seen_hashes:
             if self.hamming_distance(hash_val, seen) <= self.hamming_threshold:
                 return True, "PHASH_NEAR_DUPLICATE"
 
-        # 2. Cosine embedding layer
-        if embedding_512d is not None:
-            for seen_emb in self.registered_embeddings:
-                if self.cosine_distance(embedding_512d, seen_emb) <= self.cosine_threshold * 1.10:
-                    return True, "EMBEDDING_IDENTITY_LEAKAGE"
-
-        # Unique sample: register
         self.seen_hashes.append(hash_val)
-        if embedding_512d is not None:
-            self.registered_embeddings.append(embedding_512d)
         return False, "UNIQUE"
 
 
