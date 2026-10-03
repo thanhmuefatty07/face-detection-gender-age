@@ -1,6 +1,6 @@
 {
-  "id": "vnthanhphm/face-dataset-mining-extreme-filtering",
-  "title": "Face Dataset Mining & Extreme Filtering Pipeline",
+  "id": "vnthanhphm/face-dataset-mining-extreme-filtering-pipeline",
+  "title": "Face Dataset Mining Extreme Filtering Pipeline",
   "code_file": "kaggle_face_mining_pipeline.ipynb",
   "language": "python",
   "kernel_type": "notebook",
