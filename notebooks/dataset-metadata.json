@@ -15,5 +15,5 @@
     "extreme-filtering",
     "alpha-signals"
   ],
-  "description": "Golden biometric face dataset curated via In-Cloud Extreme Filtering, 5-point landmark similarity alignment, Label Distribution Learning (LDL), and epistemic noise removal."
+  "description": "Golden biometric face dataset curated via In-Cloud Extreme Filtering, YuNet 5-point landmark canonical alignment, Continuous Label Distribution Learning (LDL), and verified ground-truth datasets."
 }

@@ -12,33 +12,58 @@ ingestion:
   max_samples_per_dataset: 50000
   supported_extensions: [".jpg", ".jpeg", ".png", ".webp", ".bmp"]
   datasets:
+    agedb:
+      kaggle_slug: "nitingandhi/agedb-database"
+      pattern: "^(\\d+)_(.+)_(\\d+)_([mf])\\.jpg"
+      min_age: 1
+      max_age: 101
+      demographics: "50/50 gender balance, 100% verified DOB and photo date"
+    morph:
+      kaggle_slug: "chiragsaipanuganti/morph"
+      pattern: "^(\\d+)_(\\d+)([MF])(\\d{2})\\.JPG"
+      min_age: 16
+      max_age: 77
+      demographics: "Official ID mugshots, African-American & Caucasian representation"
+    utkface:
+      kaggle_slug: "jangedoo/utkface-new"
+      pattern: "^(\\d+)_([01])_([0-4])_.*"
+      min_age: 0
+      max_age: 116
+      demographics: "5 ethnicity classes, dense child coverage"
+    afad:
+      kaggle_slug: "lyk1652/afad-full"
+      root_folder: "AFAD-Full"
+      min_age: 15
+      max_age: 40
+      demographics: "East Asian verified student IDs"
+    appa_real:
+      kaggle_slug: "vnthanhphm/appa-real-age-only-v1"
+      metadata_files: ["labels_train.csv", "labels_valid.csv"]
+      min_age: 1
+      max_age: 85
+      demographics: "Real biological age + apparent age distribution with annotator variance"
+    fgnet:
+      kaggle_slug: "aiolapo/fgnet-dataset"
+      pattern: "^(\\d{3})[aA](\\d{2})"
+      min_age: 0
+      max_age: 69
+      demographics: "Dense longitudinal infancy to adolescence (0-18)"
+    b3fd:
+      kaggle_slug: "moritzm00/biometrically-filtered-famous-figure-dataset"
+      filename_format: "{name}/{id}_{dob}_{photo_year}.jpg"
+      min_age: 1
+      max_age: 101
+      demographics: "Biometrically filtered figures, elderly representation (>60)"
     fairface:
       kaggle_slug: "jovian/fairface-dataset"
       archive_names: ["fairface-img-margin025.zip", "fairface-img-margin125.zip"]
       labels: ["fairface_label_train.csv", "fairface_label_val.csv"]
-    celeba:
-      kaggle_slug: "jessicali9530/celeba-dataset"
-      archive_name: "img_align_celeba.zip"
-      landmarks_file: "list_landmarks_align_celeba.txt"
-      attributes_file: "list_attr_celeba.txt"
-      partition_file: "list_eval_partition.txt"
     imdb_wiki:
       kaggle_slug: "dimitrisk/imdb-wiki-dataset"
       mat_files: ["imdb.mat", "wiki.mat"]
       tar_files: ["imdb_crop.tar", "wiki_crop.tar"]
       min_face_score: 1.0
       max_second_face_score: 0.5
-    afad:
-      kaggle_slug: "yueyue/afad-lite"
-      root_folder: "AFAD-Full"
-      min_age: 15
-      max_age: 40
-    b3fd:
-      kaggle_slug: "moritzm00/biometrically-filtered-famous-figure-dataset"
-      metadata_file: "b3fd_metadata.csv"
-    appa_real:
-      kaggle_slug: "vnthanhphm/appa-real-age-only-v1"
-      metadata_files: ["gt_avg_train.csv", "gt_avg_valid.csv", "gt_avg_test.csv"]
 
 crawler:
   enabled: true

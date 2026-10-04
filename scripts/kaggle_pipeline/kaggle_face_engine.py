@@ -123,15 +123,20 @@ class FacialLandmarkDetector:
                 if ret > 0 and faces is not None and len(faces) > 0:
                     # Pick highest scoring face
                     best_face = faces[0]
-                    score = float(best_face[14])
-                    # landmarks: right_eye (x, y), left_eye (x, y), nose, right_mouth, left_mouth
-                    # Map to standard order: left_eye, right_eye, nose, left_mouth, right_mouth
+                    # landmarks in YuNet: 4:6 (subject right eye / viewer's left), 6:8 (subject left eye / viewer's right),
+                    # 8:10 (nose), 10:12 (subject right mouth / viewer's left), 12:14 (subject left mouth / viewer's right)
+                    # Canonical order: [viewer_left_eye, viewer_right_eye, nose, viewer_left_mouth, viewer_right_mouth]
                     r_eye = best_face[4:6]
                     l_eye = best_face[6:8]
                     nose = best_face[8:10]
                     r_mouth = best_face[10:12]
                     l_mouth = best_face[12:14]
-                    lms = np.array([l_eye, r_eye, nose, l_mouth, r_mouth], dtype=np.float32)
+                    lms = np.array([r_eye, l_eye, nose, r_mouth, l_mouth], dtype=np.float32)
+                    if lms[0, 0] > lms[1, 0]:
+                        lms[[0, 1]] = lms[[1, 0]]
+                    if lms[3, 0] > lms[4, 0]:
+                        lms[[3, 4]] = lms[[4, 3]]
+                    score = float(best_face[-1]) if len(best_face) > 14 else 1.0
                     return True, lms, score
             except Exception:
                 pass
@@ -239,6 +244,43 @@ class FacialLandmarkDetector:
 # 2. Umeyama Similarity Transform Aligner (ArcFace 160x160)
 # ============================================================================
 
+def umeyama_similarity_transform(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
+    """
+    Computes optimal 2D similarity transform matrix M [2x3] such that dst ~ M * src.
+    Solves min || dst - (c * R * src + t) ||_F using Umeyama (1991) SVD closed form.
+    """
+    assert src.shape == dst.shape and src.shape[1] == 2, "src and dst must be (N, 2)"
+    n, m = src.shape
+
+    src_mean = np.mean(src, axis=0)
+    dst_mean = np.mean(dst, axis=0)
+
+    src_demean = src - src_mean
+    dst_demean = dst - dst_mean
+
+    var_src = np.mean(np.sum(src_demean**2, axis=1))
+    if var_src < 1e-8:
+        M = np.eye(2, 3, dtype=np.float32)
+        M[:, 2] = dst_mean - src_mean
+        return M
+
+    sigma = np.dot(dst_demean.T, src_demean) / n
+
+    U, D, Vt = np.linalg.svd(sigma)
+    S = np.eye(m)
+    if np.linalg.det(U) * np.linalg.det(Vt) < 0:
+        S[m - 1, m - 1] = -1
+
+    R = np.dot(U, np.dot(S, Vt))
+    c = (1.0 / var_src) * np.trace(np.dot(np.diag(D), S))
+    t = dst_mean - c * np.dot(R, src_mean)
+
+    M = np.zeros((2, 3), dtype=np.float32)
+    M[:2, :2] = c * R
+    M[:2, 2] = t
+    return M
+
+
 class FaceGeometryAligner:
     """
     Standard facial alignment using Umeyama least-squares similarity transformation.
@@ -264,17 +306,10 @@ class FaceGeometryAligner:
         """
         assert landmarks_5.shape == (5, 2), f"Expected shape (5, 2), got {landmarks_5.shape}"
 
-        # Estimate partial affine (similarity: scale, rotation, translation) with LMEDS
-        matrix, _ = cv2.estimateAffinePartial2D(
+        matrix = umeyama_similarity_transform(
             landmarks_5.astype(np.float32),
-            self.target_landmarks,
-            method=cv2.LMEDS
+            self.target_landmarks
         )
-        if matrix is None:
-            # Fallback to standard 3-point affine on upper triangle if 5-point LMEDS fails
-            src_tri = landmarks_5[:3].astype(np.float32)
-            dst_tri = self.target_landmarks[:3]
-            matrix = cv2.getAffineTransform(src_tri, dst_tri)
 
         aligned_face = cv2.warpAffine(
             image,

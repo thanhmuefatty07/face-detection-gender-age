@@ -9,12 +9,12 @@
   "enable_tpu": false,
   "enable_internet": true,
   "dataset_sources": [
-    "vnthanhphm/face-gender-age-sota-benchmark-v6",
-    "vnthanhphm/appa-real-age-only-v1",
-    "ghaidaalatoum/fairface",
-    "jessicali9530/celeba-dataset",
-    "yuulind/imdb-clean",
+    "nitingandhi/agedb-database",
+    "chiragsaipanuganti/morph",
+    "jangedoo/utkface-new",
     "lyk1652/afad-full",
+    "vnthanhphm/appa-real-age-only-v1",
+    "aiolapo/fgnet-dataset",
     "moritzm00/biometrically-filtered-famous-figure-dataset"
   ],
   "competition_sources": [],

@@ -19,6 +19,9 @@ from .backbone import (
     ConvNeXtV2BiometricHead,
     MobileNetV4BiometricHead,
 )
+from .dataset import (
+    FaceGoldenDataset,
+)
 
 __all__ = [
     "calculate_sexual_dimorphism_weight",
@@ -32,4 +35,5 @@ __all__ = [
     "BiometricMultiTaskModel",
     "ConvNeXtV2BiometricHead",
     "MobileNetV4BiometricHead",
+    "FaceGoldenDataset",
 ]
