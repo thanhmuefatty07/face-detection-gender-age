@@ -28,7 +28,7 @@ def compute_64bit_dct_phash(image_gray: np.ndarray) -> int:
 
 def hamming_distance_64bit(h1: int, h2: int) -> int:
     """Computes bitwise Hamming distance between two 64-bit integers."""
-    return bin(h1 ^ h2).count('1')
+    return (h1 ^ h2).bit_count()
 
 
 class DualLayerDeduplicator:

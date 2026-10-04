@@ -619,7 +619,7 @@ class B3FDConnector(BaseFaceConnector):
     Cleaned biometric ages 1 to 101.
     """
 
-    FILENAME_PATTERN = re.compile(r"^(.+)_(\d{4})_(\d{4})\.(?:jpg|jpeg|png|webp|bmp)$", re.IGNORECASE)
+    FILENAME_PATTERN = re.compile(r"^(.+)_(\d{4}(?:-\d{1,2}-\d{1,2})?)_(\d{4})\.(?:jpg|jpeg|png|webp|bmp)$", re.IGNORECASE)
 
     def get_name(self) -> str:
         return "b3fd"
@@ -850,7 +850,7 @@ class AppaRealConnector(BaseFaceConnector):
             for _, row in df.iterrows():
                 if yielded >= self.max_samples:
                     return
-                fname = str(row.get('file_name', row.get('file', row.get('image', ''))))
+                fname = str(row.get('image_path', row.get('file_name', row.get('file', row.get('image', '')))))
                 if not fname:
                     continue
 
@@ -862,9 +862,14 @@ class AppaRealConnector(BaseFaceConnector):
                 sub = csv_path.stem.replace('labels_', '').replace('gt_avg_', '')
                 candidates = [
                     self.root_dir / fname,
+                    self.root_dir / raw_basename,
+                    self.root_dir / sub / raw_basename,
                     self.root_dir / sub / fname,
+                    self.root_dir / "appa-real-release" / sub / raw_basename,
                     self.root_dir / "appa-real-release" / sub / fname,
+                    self.root_dir / "appa-real-release" / raw_basename,
                     self.root_dir / "appa-real-release" / fname,
+                    self.root_dir / "images" / raw_basename,
                     self.root_dir / "images" / fname
                 ]
                 img_path = next((p for p in candidates if p.exists()), None)
@@ -1353,7 +1358,7 @@ class FGNetConnector(BaseFaceConnector):
     Group 2: Age (2 digits)
     """
 
-    PATTERN = re.compile(r"^(\d{3})[aA](\d{2})", re.IGNORECASE)
+    PATTERN = re.compile(r"^(\d{3})[aA](\d{2})([mMfF])?", re.IGNORECASE)
 
     def get_name(self) -> str:
         return "fgnet"
@@ -1399,12 +1404,14 @@ class FGNetConnector(BaseFaceConnector):
                         seen_ids.add(fname)
                         subj_id, age_str = m.group(1), m.group(2)
                         age = float(age_str)
+                        g_char = m.group(3) if len(m.groups()) >= 3 and m.group(3) else None
+                        gender = 'Male' if g_char and g_char.upper() == 'M' else ('Female' if g_char and g_char.upper() == 'F' else None)
                         yield RawImageSample(
                             image_bytes=b,
                             source_dataset=self.get_name(),
                             raw_id=fname,
                             declared_age=age,
-                            declared_gender=None,
+                            declared_gender=gender,
                             declared_ethnicity=None,
                             metadata={"fgnet_subject_id": subj_id}
                         )
@@ -1429,12 +1436,14 @@ class FGNetConnector(BaseFaceConnector):
                         seen_ids.add(fname)
                         subj_id, age_str = m.group(1), m.group(2)
                         age = float(age_str)
+                        g_char = m.group(3) if len(m.groups()) >= 3 and m.group(3) else None
+                        gender = 'Male' if g_char and g_char.upper() == 'M' else ('Female' if g_char and g_char.upper() == 'F' else None)
                         yield RawImageSample(
                             image_bytes=b,
                             source_dataset=self.get_name(),
                             raw_id=fname,
                             declared_age=age,
-                            declared_gender=None,
+                            declared_gender=gender,
                             declared_ethnicity=None,
                             metadata={"fgnet_subject_id": subj_id}
                         )
@@ -1463,13 +1472,15 @@ class FGNetConnector(BaseFaceConnector):
             seen_ids.add(img_path.name)
             subj_id, age_str = m.group(1), m.group(2)
             age = float(age_str)
+            g_char = m.group(3) if len(m.groups()) >= 3 and m.group(3) else None
+            gender = 'Male' if g_char and g_char.upper() == 'M' else ('Female' if g_char and g_char.upper() == 'F' else None)
 
             yield RawImageSample(
                 image_bytes=b,
                 source_dataset=self.get_name(),
                 raw_id=img_path.name,
                 declared_age=age,
-                declared_gender=None,
+                declared_gender=gender,
                 declared_ethnicity=None,
                 metadata={"fgnet_subject_id": subj_id}
             )
@@ -1546,7 +1557,7 @@ class DiskQuotaManager:
         self,
         working_dir: str = "/kaggle/working",
         max_storage_gb: float = 18.0,
-        min_free_gb: float = 2.0,
+        min_free_gb: float = 2.5,
         shard_image_count: int = 5000,
         archive_format: str = "tar"
     ):
@@ -1561,55 +1572,80 @@ class DiskQuotaManager:
 
         self.current_shard_idx = 0
         self.current_shard_count = 0
+        self.current_shard_records: List[Dict[str, Any]] = []
         self.current_tar_obj: Optional[tarfile.TarFile] = None
         self._open_new_shard()
+
+    def _flush_shard_manifest(self, shard_idx: int):
+        if self.current_shard_records:
+            try:
+                df_shard = pd.DataFrame(self.current_shard_records)
+                manifest_path = self.shards_dir / f"shard_{shard_idx:04d}_manifest.parquet"
+                df_shard.to_parquet(str(manifest_path), index=False)
+                print(f"[QuotaManager] Checkpointed shard manifest: {manifest_path} ({len(df_shard)} records)")
+            except Exception as e:
+                print(f"[QuotaManager] Warning saving shard manifest: {e}")
+            self.current_shard_records = []
 
     def _open_new_shard(self):
         if self.current_tar_obj:
             self.current_tar_obj.close()
+            self._flush_shard_manifest(self.current_shard_idx)
+            self.current_shard_idx += 1
         shard_file = self.shards_dir / f"shard_{self.current_shard_idx:04d}.tar"
         self.current_tar_obj = tarfile.open(shard_file, 'w')
         self.current_shard_count = 0
+
+    def check_safe(self) -> bool:
+        """Alias for check_quota."""
+        return self.check_quota()
 
     def check_quota(self) -> bool:
         """Checks if current disk usage is safely below quota ceiling."""
         try:
             total, used, free = shutil.disk_usage(self.working_dir)
             if free < self.min_free_bytes:
-                print(f"[QuotaManager] CRITICAL WARNING: Free disk space {free / (1024**3):.2f} GB < min {self.min_free_bytes / (1024**3):.2f} GB")
-                return False
-            # Also calculate size of working dir
-            working_size = sum(f.stat().st_size for f in self.working_dir.rglob('*') if f.is_file())
-            if working_size > self.max_storage_bytes:
-                print(f"[QuotaManager] QUOTA EXCEEDED: Working dir size {working_size / (1024**3):.2f} GB > limit {self.max_storage_bytes / (1024**3):.2f} GB")
+                print(f"[QuotaManager] DISK SAFETY CEILING: Free disk space {free / (1024**3):.2f} GB < {self.min_free_bytes / (1024**3):.2f} GB. Halting cleanly.")
                 return False
             return True
         except Exception:
             return True
 
-    def write_aligned_face(self, face_bgr: np.ndarray, filename: str) -> bool:
+    def write_aligned_face(
+        self,
+        face_bgr: Optional[np.ndarray],
+        filename: str,
+        record: Optional[Dict[str, Any]] = None,
+        image_bytes: Optional[bytes] = None
+    ) -> bool:
         """
-        Compresses aligned face to high-quality JPEG and appends to current tar shard.
+        Compresses aligned face to high-quality JPEG (or uses pre-encoded bytes) and appends to current tar shard.
         Avoids creating thousands of separate disk inodes.
         """
         if not self.check_quota():
             return False
 
-        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 95]
-        success, enc_buf = cv2.imencode('.jpg', face_bgr, encode_param)
-        if not success:
-            return False
+        if image_bytes is None:
+            if face_bgr is None:
+                return False
+            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 95]
+            success, enc_buf = cv2.imencode('.jpg', face_bgr, encode_param)
+            if not success:
+                return False
+            img_bytes = enc_buf.tobytes()
+        else:
+            img_bytes = image_bytes
 
-        img_bytes = enc_buf.tobytes()
         tar_info = tarfile.TarInfo(name=filename)
         tar_info.size = len(img_bytes)
 
         if self.current_tar_obj:
             self.current_tar_obj.addfile(tar_info, io.BytesIO(img_bytes))
             self.current_shard_count += 1
+            if record is not None:
+                self.current_shard_records.append(record)
 
             if self.current_shard_count >= self.shard_image_count:
-                self.current_shard_idx += 1
                 self._open_new_shard()
 
         return True
@@ -1619,6 +1655,7 @@ class DiskQuotaManager:
         if self.current_tar_obj:
             self.current_tar_obj.close()
             self.current_tar_obj = None
+            self._flush_shard_manifest(self.current_shard_idx)
 
 
 __all__ = [

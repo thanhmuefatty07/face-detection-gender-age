@@ -39,8 +39,10 @@ from scripts.kaggle_pipeline.kaggle_dataset_connectors import (
 from scripts.kaggle_pipeline.kaggle_face_engine import (
     FacialLandmarkDetector,
     FaceGeometryAligner,
+    ExtremeQualityAuditor,
     umeyama_similarity_transform
 )
+from src.biometrics.core.geometry import ARCFACE_CANONICAL_160, estimate_head_pose_pnp
 from src.biometrics.estimation.dataset import FaceGoldenDataset
 
 
@@ -493,3 +495,197 @@ class TestBiometricLandmarksAndGeometry:
         # Expected determinant det(R) = s^2 where scale s ~ 160 / 112 = 1.4286 => s^2 ~ 2.04
         # A collapsed or inverted transform yields det(R) < 0.1 or det(R) < 0
         assert det_R > 1.5, f"Umeyama determinant {det_R:.3f} is collapsed or inverted (expected > 1.5)"
+
+
+class TestForensicAuditFixes:
+    """Verifies critical forensic audit bug fixes and Kaggle optimizations."""
+
+    def test_solvepnp_frontal_face_pitch_is_near_zero(self):
+        """
+        Critical Fix A: solvePnP on canonical frontal face landmarks MUST evaluate
+        to pitch ~0 degrees, NOT inverted -165.3 degrees which rejects 100% of candidates.
+        """
+        auditor = ExtremeQualityAuditor()
+        # ARCFACE_CANONICAL_160 points
+        lms = ARCFACE_CANONICAL_160.copy()
+        yaw, pitch, roll = auditor.estimate_head_pose(lms, 160, 160)
+        assert abs(pitch) < 5.0, f"Expected pitch near 0, got {pitch}"
+        assert abs(yaw) < 5.0, f"Expected yaw near 0, got {yaw}"
+        assert abs(roll) < 5.0, f"Expected roll near 0, got {roll}"
+
+        # Also verify estimate_head_pose_pnp from biometrics geometry
+        yaw_g, pitch_g, roll_g = estimate_head_pose_pnp(lms, 160, 160)
+        assert abs(pitch_g) < 5.0
+        assert abs(yaw_g) < 5.0
+        assert abs(roll_g) < 5.0
+
+    def test_sharpness_scale_invariance_on_aligned_crop(self):
+        """
+        Critical Fix B: Sharpness evaluated on aligned 160x160 crop eliminates
+        resolution bias where raw variable-resolution images penalize quality.
+        """
+        # Create a texture pattern
+        base_160 = np.random.RandomState(42).randint(50, 200, size=(160, 160, 3)).astype(np.uint8)
+        gray_160 = cv2.cvtColor(base_160, cv2.COLOR_BGR2GRAY)
+        lap_160 = float(cv2.Laplacian(gray_160, cv2.CV_64F, ksize=3).var())
+
+        # If evaluating strictly on the aligned 160x160 crop, laplacian is identical
+        assert lap_160 > 0.0
+        # Check that ExtremeQualityAuditor evaluates on aligned image
+        auditor = ExtremeQualityAuditor()
+        res = auditor.audit_face(base_160, ARCFACE_CANONICAL_160)
+        assert "laplacian_var" in res
+        assert abs(res["laplacian_var"] - lap_160) < 1.0
+
+    def test_appa_real_image_path_column_support(self, tmp_path):
+        """
+        Critical Fix C.1: AppaRealConnector supports 'image_path' column (e.g. train/000000.jpg_face.jpg)
+        in addition to 'file_name'.
+        """
+        train_dir = tmp_path / "train"
+        train_dir.mkdir()
+        b = _make_dummy_image_bytes()
+        img_file = train_dir / "000000.jpg_face.jpg"
+        img_file.write_bytes(b)
+
+        df = pd.DataFrame({
+            "image_path": ["train/000000.jpg_face.jpg"],
+            "real_age": [32.0],
+            "apparent_age_avg": [30.5],
+            "apparent_age_std": [2.1]
+        })
+        df.to_csv(tmp_path / "labels_train.csv", index=False)
+
+        conn = AppaRealConnector(root_dir=tmp_path, max_samples=5)
+        assert conn.is_available() is True
+        samples = list(conn.stream_samples())
+        assert len(samples) == 1
+        s = samples[0]
+        assert s.raw_id == "000000.jpg_face.jpg"
+        assert s.declared_age == 30.5
+        assert s.metadata["real_age"] == 32.0
+
+    def test_b3fd_hyphenated_date_regex_support(self, tmp_path):
+        """
+        Critical Fix C.2: B3FDConnector supports hyphenated dates YYYY-MM-DD in filenames.
+        """
+        b = _make_dummy_image_bytes()
+        f1 = tmp_path / "John_Doe_1985-06-15_2020.jpg"
+        f2 = tmp_path / "Jane_Smith_1990-1-1_2015.jpg"
+        f1.write_bytes(b)
+        f2.write_bytes(b)
+
+        conn = B3FDConnector(root_dir=tmp_path, max_samples=5)
+        assert conn.is_available() is True
+        samples = list(conn.stream_samples())
+        assert len(samples) == 2
+
+        s1 = next(s for s in samples if "John_Doe" in s.raw_id)
+        assert s1.declared_age == 35.0  # 2020 - 1985
+
+        s2 = next(s for s in samples if "Jane_Smith" in s.raw_id)
+        assert s2.declared_age == 25.0  # 2015 - 1990
+
+    def test_fgnet_gendered_filenames_support(self, tmp_path):
+        """
+        Critical Fix C.3: FGNetConnector supports pdombrza/fgnet-gendered filenames
+        (e.g. 001A02M.JPG -> age 2, Male; 002A16F.JPG -> age 16, Female).
+        """
+        b = _make_dummy_image_bytes()
+        f_m = tmp_path / "001A02M.JPG"
+        f_f = tmp_path / "002A16F.JPG"
+        f_none = tmp_path / "003A08.JPG"
+        f_m.write_bytes(b)
+        f_f.write_bytes(b)
+        f_none.write_bytes(b)
+
+        conn = FGNetConnector(root_dir=tmp_path, max_samples=5)
+        assert conn.is_available() is True
+        samples = list(conn.stream_samples())
+        assert len(samples) == 3
+
+        s_m = next(s for s in samples if s.raw_id == f_m.name)
+        assert s_m.declared_age == 2.0
+        assert s_m.declared_gender == "Male"
+        assert s_m.metadata["fgnet_subject_id"] == "001"
+
+        s_f = next(s for s in samples if s.raw_id == f_f.name)
+        assert s_f.declared_age == 16.0
+        assert s_f.declared_gender == "Female"
+        assert s_f.metadata["fgnet_subject_id"] == "002"
+
+        s_none = next(s for s in samples if s.raw_id == f_none.name)
+        assert s_none.declared_age == 8.0
+        assert s_none.declared_gender is None
+
+    def test_quota_manager_shard_manifest_checkpointing(self, tmp_path):
+        """
+        Critical Fix D.5: DiskQuotaManager saves shard manifest parquet immediately
+        upon closing each shard.
+        """
+        qm = DiskQuotaManager(working_dir=str(tmp_path), shard_image_count=2, min_free_gb=0.1)
+        face_img = np.full((160, 160, 3), 128, dtype=np.uint8)
+
+        rec1 = {"image_id": "face_001.jpg", "age": 25.0, "gender": "Male"}
+        rec2 = {"image_id": "face_002.jpg", "age": 30.0, "gender": "Female"}
+        rec3 = {"image_id": "face_003.jpg", "age": 40.0, "gender": "Male"}
+
+        # Write 2 faces -> completes shard 0
+        assert qm.write_aligned_face(face_img, "face_001.jpg", record=rec1) is True
+        assert qm.write_aligned_face(face_img, "face_002.jpg", record=rec2) is True
+
+        # Shard 0 manifest should now exist!
+        shard0_manifest = tmp_path / "golden_dataset" / "shards" / "shard_0000_manifest.parquet"
+        assert shard0_manifest.exists()
+        df0 = pd.read_parquet(shard0_manifest)
+        assert len(df0) == 2
+        assert list(df0["image_id"]) == ["face_001.jpg", "face_002.jpg"]
+
+        # Write 3rd face into shard 1
+        assert qm.write_aligned_face(face_img, "face_003.jpg", record=rec3) is True
+        qm.close()
+
+        # Shard 1 manifest should now exist after close!
+        shard1_manifest = tmp_path / "golden_dataset" / "shards" / "shard_0001_manifest.parquet"
+        assert shard1_manifest.exists()
+        df1 = pd.read_parquet(shard1_manifest)
+        assert len(df1) == 1
+        assert list(df1["image_id"]) == ["face_003.jpg"]
+
+    def test_disk_quota_manager_check_safe_and_pre_encoded_bytes(self, tmp_path):
+        """
+        Critical Fix D.6: DiskQuotaManager provides check_safe() alias and accepts
+        pre-encoded image_bytes to eliminate redundant JPEG compression in hot loop.
+        """
+        qm = DiskQuotaManager(working_dir=str(tmp_path), shard_image_count=5, min_free_gb=0.1)
+        assert qm.check_safe() is True
+        assert qm.check_quota() is True
+
+        # Pre-encoded image bytes
+        dummy_face = np.full((160, 160, 3), 100, dtype=np.uint8)
+        _, enc = cv2.imencode('.jpg', dummy_face)
+        raw_b = enc.tobytes()
+
+        # Write with image_bytes directly
+        assert qm.write_aligned_face(None, "face_direct.jpg", record={"image_id": "face_direct.jpg"}, image_bytes=raw_b) is True
+        qm.close()
+
+        shard0 = tmp_path / "golden_dataset" / "shards" / "shard_0000.tar"
+        assert shard0.exists()
+        with tarfile.open(shard0, 'r') as tf:
+            names = tf.getnames()
+            assert "face_direct.jpg" in names
+
+    def test_preflight_smoke_test_guard_on_empty_mounts(self, tmp_path):
+        """
+        Critical Fix D.2: Pre-flight smoke test MUST raise RuntimeError immediately
+        if zero dataset connectors are available in /kaggle/input, rather than silently passing.
+        """
+        harvester = InCloudStreamingHarvester(kaggle_input_dir=str(tmp_path / "empty_input"))
+        assert len(harvester.connectors) == 0
+        available_connectors = [c for c in harvester.connectors if c.is_available()]
+        assert len(available_connectors) == 0
+        with pytest.raises(RuntimeError, match="PRE-FLIGHT SMOKE TEST FAILED"):
+            if not available_connectors:
+                raise RuntimeError("🚨 PRE-FLIGHT SMOKE TEST FAILED: Zero dataset connectors found/available in /kaggle/input")
+

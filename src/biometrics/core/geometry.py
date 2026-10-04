@@ -27,13 +27,13 @@ ARCFACE_CANONICAL_112 = np.array([
 # ArcFace 160x160 scaled reference points
 ARCFACE_CANONICAL_160 = ARCFACE_CANONICAL_112 * (160.0 / 112.0)
 
-# Anthropometric 3D Head Model (in mm)
+# Anthropometric 3D Head Model (in mm) - canonical coordinates
 ANTHROPOMETRIC_HEAD_3D = np.array([
-    [-33.0,  35.0, -25.0],  # Left eye center
-    [ 33.0,  35.0, -25.0],  # Right eye center
+    [-25.0, -30.0, -15.0],  # Left eye pupil (above nose)
+    [ 25.0, -30.0, -15.0],  # Right eye pupil (above nose)
     [  0.0,   0.0,   0.0],  # Pronasale (nose tip origin)
-    [-25.0, -45.0, -25.0],  # Left cheilion (mouth corner)
-    [ 25.0, -45.0, -25.0]   # Right cheilion (mouth corner)
+    [-21.0,  30.0, -15.0],  # Left cheilion / mouth corner (below nose)
+    [ 21.0,  30.0, -15.0]   # Right cheilion / mouth corner (below nose)
 ], dtype=np.float64)
 
 
@@ -113,12 +113,17 @@ def estimate_head_pose_pnp(
     image_points = landmarks_5.astype(np.float64)
 
     try:
+        rvec = np.zeros((3, 1), dtype=np.float64)
+        tvec = np.array([[0.0], [0.0], [float(focal_length)]], dtype=np.float64)
         success, rot_vec, trans_vec = cv2.solvePnP(
             ANTHROPOMETRIC_HEAD_3D,
             image_points,
             camera_matrix,
             dist_coeffs,
-            flags=cv2.SOLVEPNP_EPNP
+            rvec=rvec,
+            tvec=tvec,
+            useExtrinsicGuess=True,
+            flags=cv2.SOLVEPNP_ITERATIVE
         )
         if not success:
             return (0.0, 0.0, 0.0)

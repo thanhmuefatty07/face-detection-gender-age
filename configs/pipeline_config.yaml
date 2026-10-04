@@ -43,8 +43,8 @@ ingestion:
       max_age: 85
       demographics: "Real biological age + apparent age distribution with annotator variance"
     fgnet:
-      kaggle_slug: "aiolapo/fgnet-dataset"
-      pattern: "^(\\d{3})[aA](\\d{2})"
+      kaggle_slug: "pdombrza/fgnet-gendered"
+      pattern: "^(\\d{3})[aA](\\d{2})([mMfF])?"
       min_age: 0
       max_age: 69
       demographics: "Dense longitudinal infancy to adolescence (0-18)"
@@ -79,7 +79,7 @@ crawler:
 quota_manager:
   max_working_gb: 18.0
   warning_working_gb: 15.0
-  min_free_gb: 2.0
+  min_free_gb: 2.5
   shard_image_count: 5000
   shard_archive_format: "tar"
   jpeg_quality: 95
