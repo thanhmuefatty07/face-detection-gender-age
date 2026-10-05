@@ -69,8 +69,30 @@ class FaceGoldenDataset(Dataset):
 
         # Index sharded tar files if shards_dir is specified
         self.tar_index: Dict[str, Path] = {}
+        self._tar_handles: Dict[Path, tarfile.TarFile] = {}
         if self.shards_dir and self.shards_dir.exists():
             self._index_shards()
+
+    def _get_tar_handle(self, tar_path: Path) -> Optional[tarfile.TarFile]:
+        """Returns or opens a cached TarFile handle for persistent high-throughput reading."""
+        if tar_path not in self._tar_handles:
+            try:
+                self._tar_handles[tar_path] = tarfile.open(tar_path, "r")
+            except Exception:
+                return None
+        return self._tar_handles[tar_path]
+
+    def close(self):
+        """Closes all cached TarFile handles."""
+        for tf in self._tar_handles.values():
+            try:
+                tf.close()
+            except Exception:
+                pass
+        self._tar_handles.clear()
+
+    def __del__(self):
+        self.close()
 
     def _index_shards(self):
         """Indexes which shard tar contains which image_id for O(1) shard lookup."""
@@ -97,28 +119,30 @@ class FaceGoldenDataset(Dataset):
         # 2. From sharded tar archive
         if image_id in self.tar_index:
             tar_file = self.tar_index[image_id]
-            try:
-                with tarfile.open(tar_file, "r") as tf:
+            tf = self._get_tar_handle(tar_file)
+            if tf is not None:
+                try:
                     member = tf.getmember(image_id)
                     extracted = tf.extractfile(member)
                     if extracted:
                         return extracted.read()
-            except Exception:
-                pass
+                except Exception:
+                    pass
 
         # 3. Check shards directory directly if index was empty
         if self.shards_dir and self.shards_dir.exists():
             for tar_path in self.shards_dir.glob("*.tar"):
-                try:
-                    with tarfile.open(tar_path, "r") as tf:
+                tf = self._get_tar_handle(tar_path)
+                if tf is not None:
+                    try:
                         if image_id in tf.getnames():
                             self.tar_index[image_id] = tar_path
                             member = tf.getmember(image_id)
                             extracted = tf.extractfile(member)
                             if extracted:
                                 return extracted.read()
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
 
         return None
 

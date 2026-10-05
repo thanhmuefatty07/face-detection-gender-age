@@ -83,6 +83,26 @@ class BaseFaceConnector(ABC):
         """Yields RawImageSample objects without intermediate disk extraction."""
         pass
 
+    def _has_matching_file(self, pattern: re.Pattern, max_inspect: int = 200, max_depth: int = 3) -> bool:
+        """Fast bounded check for matching file up to max_depth without unbounded recursive walks."""
+        count = 0
+        base_depth = len(self.root_dir.parts)
+        try:
+            for root, dirs, files in os.walk(self.root_dir):
+                cur_depth = len(Path(root).parts) - base_depth
+                if cur_depth >= max_depth:
+                    dirs.clear()
+                for f in files:
+                    count += 1
+                    if count > max_inspect:
+                        return False
+                    if any(f.lower().endswith(ext) for ext in self.SUPPORTED_EXTS) and pattern.match(f):
+                        return True
+        except (PermissionError, OSError):
+            pass
+        return False
+
+
 
 class FairFaceConnector(BaseFaceConnector):
     """
@@ -506,7 +526,7 @@ class AFADConnector(BaseFaceConnector):
         for tar_path in list(self.root_dir.rglob("*.tar*")):
             try:
                 with tarfile.open(tar_path, 'r:*') as tf:
-                    for member in tf.getmembers():
+                    for member in tf:
                         if yielded >= self.max_samples:
                             return
                         if not member.isfile():
@@ -631,12 +651,7 @@ class B3FDConnector(BaseFaceConnector):
             return True
         if any(self.root_dir.glob("*.tar*")) or any(self.root_dir.glob("*.zip")):
             return True
-        for count, p in enumerate(self.root_dir.rglob("*.*")):
-            if p.suffix.lower() in self.SUPPORTED_EXTS and self.FILENAME_PATTERN.match(p.name):
-                return True
-            if count > 200:
-                break
-        return False
+        return self._has_matching_file(self.FILENAME_PATTERN)
 
     def stream_samples(self) -> Generator[RawImageSample, None, None]:
         if not self.is_available():
@@ -649,7 +664,7 @@ class B3FDConnector(BaseFaceConnector):
         for tar_path in list(self.root_dir.rglob("*.tar*")):
             try:
                 with tarfile.open(tar_path, 'r:*') as tf:
-                    for member in tf.getmembers():
+                    for member in tf:
                         if yielded >= self.max_samples:
                             return
                         if not member.isfile():
@@ -938,12 +953,7 @@ class UTKFaceConnector(BaseFaceConnector):
             return False
         if any(self.root_dir.glob("*.tar*")) or any(self.root_dir.glob("*.zip")):
             return True
-        for count, p in enumerate(self.root_dir.rglob("*.*")):
-            if p.suffix.lower() in self.SUPPORTED_EXTS and self.PATTERN.match(p.name):
-                return True
-            if count > 200:
-                break
-        return False
+        return self._has_matching_file(self.PATTERN)
 
     def stream_samples(self) -> Generator[RawImageSample, None, None]:
         if not self.is_available():
@@ -956,7 +966,7 @@ class UTKFaceConnector(BaseFaceConnector):
         for tar_path in list(self.root_dir.rglob("*.tar*")):
             try:
                 with tarfile.open(tar_path, 'r:*') as tf:
-                    for member in tf.getmembers():
+                    for member in tf:
                         if yielded >= self.max_samples:
                             return
                         if not member.isfile():
@@ -1075,12 +1085,7 @@ class AgeDBConnector(BaseFaceConnector):
             return False
         if any(self.root_dir.glob("*.zip")) or any(self.root_dir.glob("*.tar*")):
             return True
-        for count, p in enumerate(self.root_dir.rglob("*.*")):
-            if p.suffix.lower() in self.SUPPORTED_EXTS and self.PATTERN.match(p.name):
-                return True
-            if count > 200:
-                break
-        return False
+        return self._has_matching_file(self.PATTERN)
 
     def stream_samples(self) -> Generator[RawImageSample, None, None]:
         if not self.is_available():
@@ -1093,7 +1098,7 @@ class AgeDBConnector(BaseFaceConnector):
         for tar_path in list(self.root_dir.rglob("*.tar*")):
             try:
                 with tarfile.open(tar_path, 'r:*') as tf:
-                    for member in tf.getmembers():
+                    for member in tf:
                         if yielded >= self.max_samples:
                             return
                         if not member.isfile():
@@ -1230,12 +1235,7 @@ class MorphConnector(BaseFaceConnector):
             return False
         if any(self.root_dir.glob("*.tar*")) or any(self.root_dir.glob("*.zip")):
             return True
-        for count, p in enumerate(self.root_dir.rglob("*.*")):
-            if p.suffix.lower() in self.SUPPORTED_EXTS and self.PATTERN.match(p.name):
-                return True
-            if count > 200:
-                break
-        return False
+        return self._has_matching_file(self.PATTERN)
 
     def stream_samples(self) -> Generator[RawImageSample, None, None]:
         if not self.is_available():
@@ -1248,7 +1248,7 @@ class MorphConnector(BaseFaceConnector):
         for tar_path in list(self.root_dir.rglob("*.tar*")):
             try:
                 with tarfile.open(tar_path, 'r:*') as tf:
-                    for member in tf.getmembers():
+                    for member in tf:
                         if yielded >= self.max_samples:
                             return
                         if not member.isfile():
@@ -1368,12 +1368,7 @@ class FGNetConnector(BaseFaceConnector):
             return False
         if any(self.root_dir.glob("*.zip")) or any(self.root_dir.glob("*.tar*")):
             return True
-        for count, p in enumerate(self.root_dir.rglob("*.*")):
-            if p.suffix.lower() in self.SUPPORTED_EXTS and self.PATTERN.match(p.name):
-                return True
-            if count > 200:
-                break
-        return False
+        return self._has_matching_file(self.PATTERN)
 
     def stream_samples(self) -> Generator[RawImageSample, None, None]:
         if not self.is_available():
@@ -1386,7 +1381,7 @@ class FGNetConnector(BaseFaceConnector):
         for tar_path in list(self.root_dir.rglob("*.tar*")):
             try:
                 with tarfile.open(tar_path, 'r:*') as tf:
-                    for member in tf.getmembers():
+                    for member in tf:
                         if yielded >= self.max_samples:
                             return
                         if not member.isfile():
@@ -1658,6 +1653,47 @@ class DiskQuotaManager:
             self._flush_shard_manifest(self.current_shard_idx)
 
 
+def ensure_master_manifest(golden_dataset_dir: str | Path) -> pd.DataFrame:
+    """
+    Consolidates all shard manifests (shards/shard_*_manifest.parquet) into root metadata.parquet and metadata.csv.
+    Self-healing: Reconstructs master manifest from individual shard checkpoints if session was interrupted.
+    """
+    golden_dir = Path(golden_dataset_dir)
+    p_parquet = golden_dir / "metadata.parquet"
+    p_csv = golden_dir / "metadata.csv"
+    shards_dir = golden_dir / "shards"
+    shard_manifests = sorted(shards_dir.glob("shard_*_manifest.parquet")) if shards_dir.exists() else []
+
+    if shard_manifests:
+        print(f"[Manifest] Consolidating {len(shard_manifests)} shard manifest(s) from {shards_dir} ...")
+        dfs = []
+        for sm in shard_manifests:
+            try:
+                dfs.append(pd.read_parquet(sm))
+            except Exception as e:
+                print(f"⚠️ Warning reading shard manifest {sm}: {e}")
+        if dfs:
+            master = pd.concat(dfs, ignore_index=True)
+            if "sha256" in master.columns:
+                master.drop_duplicates(subset=["sha256"], inplace=True, ignore_index=True)
+            master.to_parquet(str(p_parquet), index=False)
+            master.to_csv(str(p_csv), index=False)
+            print(f"✅ Consolidated {len(master)} records across {len(shard_manifests)} shards into {p_parquet} and {p_csv}")
+            return master
+
+    if p_parquet.exists():
+        try:
+            return pd.read_parquet(p_parquet)
+        except Exception:
+            pass
+
+    empty_df = pd.DataFrame()
+    golden_dir.mkdir(parents=True, exist_ok=True)
+    empty_df.to_parquet(str(p_parquet), index=False)
+    empty_df.to_csv(str(p_csv), index=False)
+    return empty_df
+
+
 __all__ = [
     "RawImageSample",
     "BaseFaceConnector",
@@ -1673,4 +1709,5 @@ __all__ = [
     "FGNetConnector",
     "InCloudStreamingHarvester",
     "DiskQuotaManager",
+    "ensure_master_manifest",
 ]

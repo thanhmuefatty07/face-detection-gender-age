@@ -49,7 +49,9 @@ class ExtremeQualityAuditor:
     def audit_face(
         self,
         face_bgr: np.ndarray,
-        landmarks_5: Optional[np.ndarray] = None
+        landmarks_5: Optional[np.ndarray] = None,
+        raw_width: Optional[int] = None,
+        raw_height: Optional[int] = None
     ) -> FaceAuditResult:
         """
         Audits a face crop against all extreme criteria.
@@ -109,7 +111,9 @@ class ExtremeQualityAuditor:
         # 5. Anthropometric Head Pose solvePnP
         yaw, pitch, roll = 0.0, 0.0, 0.0
         if landmarks_5 is not None:
-            yaw, pitch, roll = estimate_head_pose_pnp(landmarks_5, w, h)
+            pose_w = raw_width if raw_width is not None else w
+            pose_h = raw_height if raw_height is not None else h
+            yaw, pitch, roll = estimate_head_pose_pnp(landmarks_5, pose_w, pose_h)
             eps = 1e-4
             if abs(yaw) - self.max_abs_yaw > eps:
                 rejection_reasons.append(f"EXCESSIVE_YAW (|{yaw:.1f}°| > {self.max_abs_yaw}°)")

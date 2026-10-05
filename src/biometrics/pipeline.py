@@ -67,6 +67,7 @@ class BiometricPipeline:
         if frame_bgr is None or frame_bgr.size == 0:
             return []
 
+        frame_h, frame_w = frame_bgr.shape[:2]
         detections = self.detector.detect(frame_bgr)
         results = []
 
@@ -82,7 +83,12 @@ class BiometricPipeline:
             # 2. Extreme Quality Audit
             audit_res = None
             if self.enable_quality_audit:
-                audit_res = self.auditor.audit_face(aligned_160, det.landmarks.points)
+                audit_res = self.auditor.audit_face(
+                    aligned_160,
+                    det.landmarks.points,
+                    raw_width=frame_w,
+                    raw_height=frame_h
+                )
 
             # 3. Biometric Multi-Task Prediction
             # If face passed audit (or audit disabled), perform biometric estimation

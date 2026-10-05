@@ -431,11 +431,10 @@ class ExtremeQualityAuditor:
             roll_deg = math.degrees(roll)
 
             def normalize_angle_to_frontal(deg: float) -> float:
-                deg = (deg + 180.0) % 360.0 - 180.0
-                if deg > 90.0:
-                    deg = 180.0 - deg
-                elif deg < -90.0:
-                    deg = -180.0 - deg
+                while deg > 90.0:
+                    deg -= 180.0
+                while deg < -90.0:
+                    deg += 180.0
                 return deg
 
             return float(normalize_angle_to_frontal(yaw_deg)), float(normalize_angle_to_frontal(pitch_deg)), float(normalize_angle_to_frontal(roll_deg))

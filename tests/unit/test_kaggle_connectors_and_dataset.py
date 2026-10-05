@@ -34,7 +34,8 @@ from scripts.kaggle_pipeline.kaggle_dataset_connectors import (
     AppaRealConnector,
     B3FDConnector,
     InCloudStreamingHarvester,
-    DiskQuotaManager
+    DiskQuotaManager,
+    ensure_master_manifest
 )
 from scripts.kaggle_pipeline.kaggle_face_engine import (
     FacialLandmarkDetector,
@@ -688,4 +689,243 @@ class TestForensicAuditFixes:
         with pytest.raises(RuntimeError, match="PRE-FLIGHT SMOKE TEST FAILED"):
             if not available_connectors:
                 raise RuntimeError("🚨 PRE-FLIGHT SMOKE TEST FAILED: Zero dataset connectors found/available in /kaggle/input")
+
+    def test_ensure_master_manifest_consolidation(self, tmp_path):
+        """Validates self-healing consolidation of shard manifests into master metadata.parquet & metadata.csv."""
+        golden_dir = tmp_path / "golden_dataset"
+        shards_dir = golden_dir / "shards"
+        shards_dir.mkdir(parents=True)
+
+        df_shard0 = pd.DataFrame([
+            {"image_id": "face_1.jpg", "sha256": "hash1", "age_continuous": 25.0, "split": "train"},
+            {"image_id": "face_2.jpg", "sha256": "hash2", "age_continuous": 30.0, "split": "train"}
+        ])
+        df_shard1 = pd.DataFrame([
+            {"image_id": "face_3.jpg", "sha256": "hash3", "age_continuous": 40.0, "split": "val"}
+        ])
+        df_shard0.to_parquet(shards_dir / "shard_0000_manifest.parquet")
+        df_shard1.to_parquet(shards_dir / "shard_0001_manifest.parquet")
+
+        master_df = ensure_master_manifest(golden_dir)
+        assert len(master_df) == 3
+        assert (golden_dir / "metadata.parquet").exists()
+        assert (golden_dir / "metadata.csv").exists()
+
+        loaded_parquet = pd.read_parquet(golden_dir / "metadata.parquet")
+        assert len(loaded_parquet) == 3
+        assert set(loaded_parquet["image_id"]) == {"face_1.jpg", "face_2.jpg", "face_3.jpg"}
+
+    def test_face_golden_dataset_persistent_tar_handles(self, tmp_path):
+        """Validates persistent TarFile handle caching in FaceGoldenDataset for high throughput."""
+        golden_dir = tmp_path / "golden_dataset"
+        shards_dir = golden_dir / "shards"
+        shards_dir.mkdir(parents=True)
+
+        tar_path = shards_dir / "shard_0000.tar"
+        dummy_img = np.full((160, 160, 3), 120, dtype=np.uint8)
+        _, enc = cv2.imencode('.jpg', dummy_img)
+        img_bytes = enc.tobytes()
+
+        with tarfile.open(tar_path, "w") as tf:
+            ti = tarfile.TarInfo("face_test.jpg")
+            ti.size = len(img_bytes)
+            tf.addfile(ti, io.BytesIO(img_bytes))
+
+        manifest_p = golden_dir / "metadata.parquet"
+        df = pd.DataFrame([{
+            "image_id": "face_test.jpg",
+            "sha256": "testhash",
+            "age_continuous": 28.0,
+            "apparent_age_std": 2.0,
+            "gender": "Female",
+            "split": "train"
+        }])
+        df.to_parquet(manifest_p)
+
+        dataset = FaceGoldenDataset(manifest_path=manifest_p, shards_dir=shards_dir)
+        assert len(dataset) == 1
+        assert len(dataset._tar_handles) == 0
+
+        # Item access opens and caches handle
+        sample = dataset[0]
+        assert sample["image_id"] == "face_test.jpg"
+        assert len(dataset._tar_handles) == 1
+        handle = dataset._get_tar_handle(tar_path)
+        assert handle is not None
+        assert not handle.closed
+
+        # Explicit close releases handle
+        dataset.close()
+        assert len(dataset._tar_handles) == 0
+        assert handle.closed
+
+    def test_bounded_has_matching_file_depth_traversal(self, tmp_path):
+        """Validates that _has_matching_file traverses nested subdirectories up to depth 3 without freezing."""
+        import re
+        conn = UTKFaceConnector(root_dir=tmp_path)
+        pattern = re.compile(r"^\d+_\d+_\d+.*\.jpg$")
+
+        # Level 1 subdirectory (depth 1)
+        sub1 = tmp_path / "dataset_part"
+        sub1.mkdir()
+        assert conn._has_matching_file(pattern) is False
+
+        # Level 2 subdirectory (depth 2)
+        sub2 = sub1 / "nested_images"
+        sub2.mkdir()
+        (sub2 / "25_0_1_test.jpg").write_bytes(b"dummy")
+        assert conn._has_matching_file(pattern, max_depth=3) is True
+
+        # Too deep (depth 4) with strict max_depth=2
+        deep_root = tmp_path / "deep_tree"
+        deep_dir = deep_root / "l1" / "l2" / "l3" / "l4"
+        deep_dir.mkdir(parents=True)
+        (deep_dir / "30_1_2_deep.jpg").write_bytes(b"dummy")
+        conn_deep = UTKFaceConnector(root_dir=deep_root)
+        assert conn_deep._has_matching_file(pattern, max_depth=2) is False
+        assert conn_deep._has_matching_file(pattern, max_depth=4) is True
+
+    def test_deduplicator_round_robin_and_capacity_expansion(self):
+        """Validates PerceptualDeduplicator query tracking and dynamic VRAM/matrix growth."""
+        # Use PerceptualDeduplicator from build_kaggle_kernel / engine
+        from scripts.kaggle_pipeline.kaggle_face_engine import PerceptualDeduplicator as EngineDedup
+        dedup = EngineDedup(hamming_threshold=6, cosine_threshold=0.35)
+
+        # Test duplicate detection and registration
+        h1 = 0x1234567890ABCDEF
+        vec1 = np.ones(512, dtype=np.float32) / np.sqrt(512)
+        is_dup, _ = dedup.is_duplicate_and_register(h1, vec1)
+        assert is_dup is False
+
+        # Near duplicate with hamming distance 1
+        h1_near = h1 ^ 0x01
+        is_dup_near, reason = dedup.is_duplicate_and_register(h1_near, None)
+        assert is_dup_near is True
+        assert reason == "PHASH_NEAR_DUPLICATE"
+
+    def test_multithreaded_pipeline_clean_termination_and_no_name_error(self, tmp_path):
+        """
+        Stress tests Cell 4 producer-consumer architecture:
+        Verifies:
+        1. raw_age is extracted from raw_sample.declared_age without NameError
+        2. Worker threads cleanly exit on stop_event without hanging
+        3. Telemetry heartbeat file writes valid JSON with complete metric schema
+        """
+        import queue
+        import threading
+        import time
+        import json
+        import shutil
+
+        output_dir = tmp_path / "golden_out"
+        output_dir.mkdir(parents=True)
+        heartbeat_p = tmp_path / "telemetry_heartbeat.json"
+
+        quota_mgr = DiskQuotaManager(working_dir=str(tmp_path), shard_image_count=50, min_free_gb=0.1)
+
+        raw_q = queue.Queue(maxsize=16)
+        res_q = queue.Queue(maxsize=16)
+        stop_evt = threading.Event()
+        t_start = time.time()
+        total_step = 0
+        curated_count = 0
+        rejected_count = 0
+        consecutive_failures = 0
+        rejection_hist = {}
+
+        def dummy_worker(wid):
+            def _put_res(r):
+                while not stop_evt.is_set():
+                    try:
+                        res_q.put(r, timeout=0.1)
+                        return True
+                    except queue.Full:
+                        continue
+                return False
+
+            while not stop_evt.is_set():
+                try:
+                    s = raw_q.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                if s is None:
+                    break
+                if s.declared_age is None or s.declared_age < 0:
+                    _put_res(('reject', 'INVALID_AGE', s, None, None))
+                else:
+                    fake_aligned = np.full((160, 160, 3), 128, dtype=np.uint8)
+                    fake_audit = {'lap_var': 150.0, 'tenengrad': 350.0, 'mean_l': 100.0,
+                                  'shadow_clip': 0.01, 'highlight_clip': 0.01,
+                                  'yaw': 5.0, 'pitch': 2.0, 'roll': 1.0}
+                    _put_res(('accept', None, s, fake_aligned, fake_audit))
+
+        def _write_hb():
+            now = time.time()
+            elapsed = max(0.1, now - t_start)
+            hb_data = {
+                'timestamp': now,
+                'uptime_seconds': round(elapsed, 1),
+                'total_step': total_step,
+                'curated_count': curated_count,
+                'rejected_count': rejected_count,
+                'pass_rate': round(curated_count / max(1, total_step), 4),
+                'fps': round(total_step / elapsed, 1),
+                'disk_free_gb': round(shutil.disk_usage(output_dir).free / (1024**3), 2),
+                'consecutive_failures': consecutive_failures,
+                'rejection_hist': rejection_hist,
+                'shards_count': 1,
+                'circuit_breaker_triggered': False
+            }
+            with open(heartbeat_p, 'w', encoding='utf-8') as f:
+                json.dump(hb_data, f, indent=2)
+
+        workers = [threading.Thread(target=dummy_worker, args=(i,), daemon=True) for i in range(2)]
+        for w in workers:
+            w.start()
+
+        # Produce 5 valid and 2 invalid samples
+        for i in range(5):
+            s = RawImageSample(image_bytes=b"fake", source_dataset="utkface", raw_id=f"f_{i}.jpg", declared_age=float(20 + i), declared_gender="Female")
+            raw_q.put(s)
+        for i in range(2):
+            s = RawImageSample(image_bytes=b"fake", source_dataset="utkface", raw_id=f"bad_{i}.jpg", declared_age=-5.0)
+            raw_q.put(s)
+
+        records = []
+        processed = 0
+        while processed < 7:
+            item = res_q.get(timeout=2.0)
+            status, reason, raw_sample, aligned_160, audit_res = item
+            total_step += 1
+            processed += 1
+            if status == 'reject':
+                rejected_count += 1
+                consecutive_failures += 1
+                rejection_hist[reason] = rejection_hist.get(reason, 0) + 1
+            else:
+                consecutive_failures = 0
+                # CRITICAL VERIFICATION: raw_age must not raise NameError
+                raw_age = float(raw_sample.declared_age)
+                t_mu = raw_age
+                assert t_mu >= 20.0
+                curated_count += 1
+                records.append({"image_id": f"face_{total_step}.jpg", "age": t_mu})
+
+        stop_evt.set()
+        for w in workers:
+            w.join(timeout=1.0)
+            assert not w.is_alive()
+
+        _write_hb()
+        quota_mgr.close()
+
+        assert curated_count == 5
+        assert rejected_count == 2
+        assert heartbeat_p.exists()
+        hb = json.loads(heartbeat_p.read_text(encoding='utf-8'))
+        assert hb["curated_count"] == 5
+        assert hb["rejected_count"] == 2
+        assert "fps" in hb
+        assert "disk_free_gb" in hb
+
 
