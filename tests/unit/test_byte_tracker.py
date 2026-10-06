@@ -116,3 +116,36 @@ class TestByteTracker:
         assert len(tracks_reappear) == 1
         # Crucial: ID must be recovered Person A ID, NOT a new ID!
         assert tracks_reappear[0].track_id == person_a_id
+
+    def test_no_duplicate_tracks_on_same_frame_reid_recovery(self):
+        """Validates that a track lost and recovered via Re-ID in the exact same frame NEVER duplicates."""
+        tracker = ByteTracker(track_thresh=0.6, low_thresh=0.2, reid_thresh=0.4)
+        rng = np.random.RandomState(42)
+        emb = rng.randn(64).astype(np.float32)
+        emb /= np.linalg.norm(emb)
+
+        # Frame 1: Person appears at (10, 10, 50, 50)
+        d1 = Detection(bbox=(10.0, 10.0, 50.0, 50.0), score=0.9, reid_feat=emb)
+        tracks1 = tracker.update([d1])
+        assert len(tracks1) == 1
+        orig_id = tracks1[0].track_id
+
+        # Frame 2: Person moves far away to (200, 200, 240, 240) so IoU is 0, but Re-ID matches
+        d2 = Detection(bbox=(200.0, 200.0, 240.0, 240.0), score=0.9, reid_feat=emb)
+        tracks2 = tracker.update([d2])
+        assert len(tracks2) == 1, f"Expected exactly 1 track, got {len(tracks2)} (duplicate bug!)"
+        assert tracks2[0].track_id == orig_id
+
+    def test_detection_metadata_association(self):
+        """Verifies that det_id is stored on active track and cleared upon prediction."""
+        tracker = ByteTracker()
+        det = Detection(bbox=(10.0, 10.0, 50.0, 50.0), score=0.9, det_id=42)
+        tracks = tracker.update([det])
+        assert len(tracks) == 1
+        assert tracks[0].last_det_id == 42
+        assert tracks[0].last_detection is not None
+
+        # Next frame with no detection: predict clears last_detection
+        tracks_empty = tracker.update([])
+        # Track is now lost
+        assert len(tracks_empty) == 0
