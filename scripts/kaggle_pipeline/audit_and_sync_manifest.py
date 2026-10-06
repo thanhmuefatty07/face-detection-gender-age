@@ -160,11 +160,11 @@ def generate_audit_report(manifest_path: Path, output_report_path: Path) -> str:
 ---
 
 ## 1. Kiểm Định Chất Lượng Cực Đoan (Extreme Quality Gate Audit)
-- **Phương sai Laplacian trung bình**: {mean_lap:.2f} (Ngưỡng tối thiểu: $\ge 100.0$)
-- **Năng lượng cạnh Tenengrad trung bình**: {mean_ten:.2f} (Ngưỡng tối thiểu: $\ge 250.0$)
+- **Phương sai Laplacian trung bình**: {mean_lap:.2f} (Ngưỡng tối thiểu: $\\ge 100.0$)
+- **Năng lượng cạnh Tenengrad trung bình**: {mean_ten:.2f} (Ngưỡng tối thiểu: $\\ge 250.0$)
 - **Độ sáng trung bình kênh L (CIE L*a*b*)**: {mean_lum:.2f} (Khoảng hợp lệ: $[35.0, 220.0]$)
 - **Căn chỉnh 5 điểm mốc ArcFace 160×160**: 100.0%
-- **Góc quay đầu (Head Pose solvePnP)**: Giới hạn $|Yaw| \le 35^\circ, |Pitch| \le 25^\circ, |Roll| \le 20^\circ$
+- **Góc quay đầu (Head Pose solvePnP)**: Giới hạn $|Yaw| \\le 35^\\circ, |Pitch| \\le 25^\\circ, |Roll| \\le 20^\\circ$
 
 ---
 

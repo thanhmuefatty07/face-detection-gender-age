@@ -613,13 +613,6 @@ if __name__ == "__main__":
     }
 
     out_p.write_text(json.dumps(nb_data, indent=2), encoding="utf-8")
-
-    # Also update notebooks/kaggle_training_convnextv2.ipynb if output_path is different
-    alt_p = Path("notebooks/kaggle_training_convnextv2.ipynb")
-    if out_p.resolve() != alt_p.resolve():
-        alt_p.parent.mkdir(parents=True, exist_ok=True)
-        alt_p.write_text(json.dumps(nb_data, indent=2), encoding="utf-8")
-
     return out_p
 
 
