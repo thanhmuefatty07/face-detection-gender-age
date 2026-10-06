@@ -147,6 +147,124 @@ def aleatoric_heteroscedastic_loss(
     return loss_unc
 
 
+class CoupledHeteroscedasticLaplaceLoss(nn.Module):
+    """
+    Coupled Heteroscedastic Laplace Loss with Huber Bounds.
+    L = exp(-s) * Huber_delta(y_hat - y) + s
+    where s = log_variance (or log-scale parameter).
+    
+    Provides:
+    1. Smooth C1 quadratic region near zero (|r| <= delta) preventing gradient oscillations.
+    2. Linear Huber region (|r| > delta) preventing gradient explosion.
+    3. Smooth gradient scaling: for corrupt or occluded faces with high predicted uncertainty s,
+       exp(-s) smoothly scales down gradients into the feature backbone, preventing representation corruption.
+    """
+
+    def __init__(
+        self,
+        delta: float = 1.0,
+        min_log_var: float = -10.0,
+        max_log_var: float = 10.0,
+        detach_mean: bool = False,
+    ):
+        super().__init__()
+        self.delta = float(delta)
+        self.min_log_var = float(min_log_var)
+        self.max_log_var = float(max_log_var)
+        self.detach_mean = detach_mean
+
+    def forward(
+        self,
+        expected_age: torch.Tensor,
+        target_age: torch.Tensor,
+        log_variance: torch.Tensor,
+        sample_weights: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        mu = expected_age.float().view(-1)
+        if self.detach_mean:
+            mu = mu.detach()
+        target = target_age.float().view(-1)
+        s = torch.clamp(log_variance.float().view(-1), min=self.min_log_var, max=self.max_log_var)
+
+        huber = F.huber_loss(mu, target, delta=self.delta, reduction="none")
+        loss = torch.exp(-s) * huber + s
+
+        if sample_weights is not None:
+            w = sample_weights.float().view(-1)
+            valid_w = torch.sum(w)
+            if valid_w > 1e-8:
+                return torch.sum(loss * w) / (valid_w + 1e-8)
+
+        return torch.mean(loss)
+
+
+class SupervisedContrastiveLoss(nn.Module):
+    """
+    Supervised Contrastive Loss (SupCon - Khosla et al., NeurIPS 2020).
+    Encourages normalized Re-ID embeddings of the same identity to pull together
+    while pushing distinct identities apart on the unit hypersphere.
+    
+    L_supcon = - sum_{i} (1 / |P(i)|) * sum_{p in P(i)} log( exp(z_i . z_p / tau) / sum_{a != i} exp(z_i . z_a / tau) )
+    """
+
+    def __init__(self, temperature: float = 0.07):
+        super().__init__()
+        self.temperature = float(temperature)
+
+    def forward(self, embeddings: torch.Tensor, labels: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            embeddings: (B, D) feature embeddings (will be L2-normalized)
+            labels: (B,) identity / cluster label tensor
+        Returns:
+            Scalar contrastive loss tensor
+        """
+        device = embeddings.device
+        B = embeddings.shape[0]
+        if B <= 1 or labels is None:
+            return torch.sum(embeddings * 0.0)
+
+        # Ensure unit L2 normalization
+        norm_emb = F.normalize(embeddings, p=2, dim=-1)
+
+        labels = labels.contiguous().view(-1, 1)
+        # Pairwise label equality mask: (B, B)
+        label_mask = torch.eq(labels, labels.T).float()
+
+        # Mask out self-contrast (diagonal)
+        diag_mask = torch.scatter(
+            torch.ones_like(label_mask),
+            1,
+            torch.arange(B, device=device).view(-1, 1),
+            0.0
+        )
+        pos_mask = label_mask * diag_mask
+
+        # Compute dot product similarities scaled by temperature
+        sim = torch.div(torch.matmul(norm_emb, norm_emb.T), self.temperature)
+
+        # Subtract max for numerical stability
+        sim_max, _ = torch.max(sim, dim=1, keepdim=True)
+        logits = sim - sim_max.detach()
+
+        # Denominator over all pairs except self
+        exp_logits = torch.exp(logits) * diag_mask
+        denom = torch.log(exp_logits.sum(1, keepdim=True) + 1e-12)
+        log_prob = logits - denom
+
+        # Mean over positive pairs per anchor
+        pos_counts = pos_mask.sum(1)
+        has_positives = pos_counts > 0
+
+        if not has_positives.any():
+            return torch.sum(norm_emb * 0.0)
+
+        # Average log-probability over positive pairs
+        mean_log_prob_pos = (pos_mask * log_prob).sum(1)[has_positives] / (pos_counts[has_positives] + 1e-12)
+        loss = -torch.mean(mean_log_prob_pos)
+        return loss
+
+
 class UnifiedBiometricLoss(nn.Module):
     """
     Unified multi-task loss combining:
@@ -154,7 +272,8 @@ class UnifiedBiometricLoss(nn.Module):
     - Soft-KL Divergence (FP16 protected)
     - Soft-L1 MAE
     - Masked Dimorphic BCE (valid-sample normalized)
-    - Aleatoric Heteroscedastic Uncertainty (L1-Detached Laplace)
+    - Aleatoric Heteroscedastic Uncertainty (L1-Detached Laplace or Coupled Huber)
+    - Supervised Contrastive Loss for 64-D Re-ID Head (weight 0.15)
     """
 
     def __init__(
@@ -164,6 +283,9 @@ class UnifiedBiometricLoss(nn.Module):
         weight_mae: float = 0.2,
         weight_gender: float = 1.0,
         weight_aleatoric: float = 0.1,
+        weight_reid: float = 0.15,
+        reid_temperature: float = 0.07,
+        use_coupled_laplace: bool = False,
     ):
         super().__init__()
         self.weight_cramer = weight_cramer
@@ -171,6 +293,10 @@ class UnifiedBiometricLoss(nn.Module):
         self.weight_mae = weight_mae
         self.weight_gender = weight_gender
         self.weight_aleatoric = weight_aleatoric
+        self.weight_reid = weight_reid
+        self.supcon_loss = SupervisedContrastiveLoss(temperature=reid_temperature)
+        self.coupled_laplace_loss = CoupledHeteroscedasticLaplaceLoss()
+        self.use_coupled_laplace = use_coupled_laplace
 
     def forward(
         self,
@@ -187,12 +313,15 @@ class UnifiedBiometricLoss(nn.Module):
                 - 'expected_age': (B,)
                 - 'gender_logit': (B,)
                 - 'log_variance': (B,)
+                - 'reid_embedding': Optional (B, 64)
             targets: dictionary with keys:
                 - 'ldl_101': (B, 101)
                 - 'age_continuous': (B,)
                 - 'gender': (B,)
                 - 'gender_mask': (B,)
                 - 'dimorphism_weight': (B,)
+                - 'identity': Optional (B,) identity IDs
+                - 'alpha_sample_weight': Optional (B,)
         Returns:
             Tuple of (total_loss, metrics_dict)
         """
@@ -220,12 +349,44 @@ class UnifiedBiometricLoss(nn.Module):
             dimorphism_w
         )
 
-        # 5. Aleatoric Heteroscedastic Loss (L1-Detached Laplace)
-        l_aleatoric = aleatoric_heteroscedastic_loss(
-            preds["expected_age"],
-            targets["age_continuous"],
-            preds["log_variance"]
-        )
+        # 5. Aleatoric Heteroscedastic Loss
+        if self.use_coupled_laplace:
+            sample_w = targets.get("alpha_sample_weight", None)
+            l_aleatoric = self.coupled_laplace_loss(
+                preds["expected_age"],
+                targets["age_continuous"],
+                preds["log_variance"],
+                sample_weights=sample_w,
+            )
+        else:
+            l_aleatoric = aleatoric_heteroscedastic_loss(
+                preds["expected_age"],
+                targets["age_continuous"],
+                preds["log_variance"]
+            )
+
+        # 6. Re-ID Supervised Contrastive Loss
+        reid_emb = preds.get("reid_embedding")
+        if reid_emb is not None:
+            id_labels = targets.get(
+                "identity",
+                targets.get("reid_label", targets.get("labels", targets.get("subject_id", None)))
+            )
+            if id_labels is not None:
+                l_reid = self.supcon_loss(reid_emb, id_labels)
+            elif "age_continuous" in targets and "gender" in targets and self.weight_reid > 0:
+                cohort_bins = (targets["age_continuous"] / 5.0).long()
+                gender_bins = (targets["gender"] >= 0.5).long()
+                pseudo_labels = cohort_bins * 2 + gender_bins
+                l_reid = self.supcon_loss(reid_emb, pseudo_labels)
+            else:
+                l_reid = torch.sum(reid_emb * 0.0)
+        else:
+            l_reid = torch.tensor(0.0, device=preds["age_probs"].device if "age_probs" in preds else "cpu")
+
+        # Optional teacher alpha sample weighting scalar
+        alpha_w = targets.get("alpha_sample_weight", None)
+        alpha_scale = float(alpha_w.item()) if (alpha_w is not None and alpha_w.numel() == 1) else 1.0
 
         # Weighted total
         total_loss = (
@@ -234,7 +395,8 @@ class UnifiedBiometricLoss(nn.Module):
             + self.weight_mae * l_mae
             + self.weight_gender * l_gender
             + self.weight_aleatoric * l_aleatoric
-        )
+            + self.weight_reid * l_reid
+        ) * alpha_scale
 
         metrics = {
             "loss_total": float(total_loss.item()),
@@ -243,6 +405,7 @@ class UnifiedBiometricLoss(nn.Module):
             "loss_mae": float(l_mae.item()),
             "loss_gender": float(l_gender.item()),
             "loss_aleatoric": float(l_aleatoric.item()),
+            "loss_reid": float(l_reid.item()),
         }
 
         return total_loss, metrics

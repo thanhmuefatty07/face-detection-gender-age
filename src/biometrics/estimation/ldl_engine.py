@@ -11,11 +11,128 @@ from typing import Tuple
 import numpy as np
 
 
-def compute_gaussian_ldl(mean_age: float, sigma: float = 2.5, num_bins: int = 101) -> np.ndarray:
+def _boundary_calibrate_distribution(
+    probs: np.ndarray,
+    target_mean: float,
+    max_iter: int = 25,
+    tol: float = 1e-6,
+) -> np.ndarray:
+    """
+    Moment calibration via exponential tilting:
+    q_k(\\lambda) \\propto q_k * \\exp(\\lambda * (k - \\mu))
+    Finds \\lambda such that \\sum k * q_k(\\lambda) == target_mean within tol.
+    """
+    num_bins = len(probs)
+    bins = np.arange(num_bins, dtype=np.float64)
+    lam = 0.0
+    p = probs.copy().astype(np.float64)
+
+    for _ in range(max_iter):
+        exp_factor = np.exp(np.clip(lam * (bins - target_mean), -50.0, 50.0))
+        w = probs * exp_factor
+        w_sum = np.sum(w)
+        if w_sum <= 1e-15:
+            break
+        p = w / w_sum
+        cur_mean = np.sum(bins * p)
+        err = cur_mean - target_mean
+        if abs(err) <= tol:
+            return p.astype(np.float32)
+        var = np.sum(((bins - cur_mean) ** 2) * p)
+        if var < 1e-8:
+            break
+        lam -= err / var
+
+    return p.astype(np.float32)
+
+
+def get_adaptive_sigma(mean_age: float, base_sigma: float = 2.5) -> float:
+    """
+    Age-adaptive standard deviation sigma(a) reflecting biological face development:
+    Facial morphology develops rapidly in infancy/childhood, requiring narrower sigma,
+    while adult/elderly appearance variance is broader.
+    Bound to prevent truncation expectation distortion near boundaries (Bhatia-Davis).
+    """
+    if mean_age <= 0.0:
+        return 0.32
+    elif mean_age < 5.0:
+        return float(min(base_sigma, 0.32 + 0.31 * mean_age))
+    elif mean_age > 95.0:
+        dist_to_max = max(0.0, 100.0 - mean_age)
+        return float(min(base_sigma, 0.32 + 0.31 * dist_to_max))
+    return float(base_sigma)
+
+
+def compute_boundary_calibrated_ldl(
+    mean_age: float,
+    sigma: float = 2.5,
+    num_bins: int = 101,
+) -> np.ndarray:
+    """
+    Boundary-Calibrated Folded Gaussian Label Distribution Learning (BC-LDL).
+    
+    For ages near boundaries (mean_age < 5.0 or mean_age > num_bins - 1 - 5.0):
+    1. Evaluates Gaussian with age-adaptive sigma(a) and folds/reflects truncated mass
+       back into the active range: q_k^* = q_k + q_{-k} (for lower boundary)
+       and q_k^* = q_k + q_{2K - k} (for upper boundary K = num_bins - 1).
+    2. Applies moment calibration to ensure the continuous expectation sum(k * q_k^*)
+       strictly equals mean_age within +/- 0.0001 (e.g. exactly 1.0000 for age 1.0),
+       eliminating infant boundary distortion and Soft-L1 MAE gradient conflicts.
+    """
+    mean_age = float(np.clip(mean_age, 0.0, num_bins - 1))
+    sigma = get_adaptive_sigma(mean_age, base_sigma=float(sigma))
+    bins = np.arange(num_bins, dtype=np.float64)
+    K = float(num_bins - 1)
+
+    # Base Gaussian over [0, K]
+    q_pos = np.exp(-0.5 * ((bins - mean_age) / sigma) ** 2)
+
+    # Folded reflection across lower boundary (k = 0): q_{-k} folded into q_k
+    q_neg_lower = np.exp(-0.5 * ((-bins - mean_age) / sigma) ** 2)
+
+    # Folded reflection across upper boundary (k = K): q_{2K - k} folded into q_k
+    q_neg_upper = np.exp(-0.5 * ((2.0 * K - bins - mean_age) / sigma) ** 2)
+
+    # Fold reflected mass (exclude boundaries from self double-counting)
+    q = q_pos.copy()
+    q[1:] += q_neg_lower[1:]
+    q[:-1] += q_neg_upper[:-1]
+
+    # Simplex normalization
+    q = np.maximum(q, 1e-12)
+    q /= np.sum(q)
+
+    # Boundary calibration if in boundary regions
+    if mean_age < 5.0 or mean_age > (K - 5.0):
+        q = _boundary_calibrate_distribution(q, mean_age)
+
+    # Final simplex guarantee
+    q = np.maximum(q, 1e-12)
+    q /= np.sum(q)
+    return q.astype(np.float32)
+
+
+# Alias
+compute_bc_ldl = compute_boundary_calibrated_ldl
+
+
+def compute_gaussian_ldl(
+    mean_age: float,
+    sigma: float = 2.5,
+    num_bins: int = 101,
+    boundary_calibrate: bool = True,
+) -> np.ndarray:
     """
     Computes a continuous Gaussian label distribution over [0, num_bins - 1].
     Guarantees sum(p) == 1.0 (simplex conservation).
+    
+    When boundary_calibrate=True (default), uses BC-LDL near boundaries
+    (age < 5 or age > 95) to fold truncated mass and guarantee expectation matches
+    target age within +/- 0.0001 (e.g., 1.0000 for age 1.0).
     """
+    if boundary_calibrate and (mean_age < 5.0 or mean_age > (num_bins - 1 - 5.0)):
+        return compute_boundary_calibrated_ldl(mean_age=mean_age, sigma=sigma, num_bins=num_bins)
+
     sigma = max(sigma, 0.5)
     bins = np.arange(num_bins, dtype=np.float64)
 

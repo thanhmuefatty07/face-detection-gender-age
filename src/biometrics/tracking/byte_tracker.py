@@ -332,9 +332,22 @@ class ByteTracker:
             if cost_reid.size > 0:
                 row_ind, col_ind = linear_sum_assignment(cost_reid)
                 for r, c in zip(row_ind, col_ind):
-                    is_reid_match = (cost_reid[r, c] <= self.reid_thresh)
+                    has_reid = (
+                        self.lost_tracks[r].reid_feat is not None
+                        and unmatched_dets_high[c].reid_feat is not None
+                    )
                     is_iou_match = (cost_iou.size > 0 and cost_iou[r, c] <= 0.7)
-                    if is_reid_match or is_iou_match:
+
+                    if has_reid:
+                        # Strict Gated Matching: appearance cosine distance must be <= threshold (0.35).
+                        # Overlapping bounding boxes of distinct individuals (cost_reid > 0.35) are strictly rejected.
+                        is_reid_match = (cost_reid[r, c] <= self.reid_thresh)
+                        is_gated_match = is_reid_match
+                    else:
+                        # Fallback to spatial IoU proximity only when no Re-ID features are registered
+                        is_gated_match = is_iou_match
+
+                    if is_gated_match:
                         rec_t = self.lost_tracks[r]
                         rec_t.update(unmatched_dets_high[c])
                         recovered_stracks.append(rec_t)

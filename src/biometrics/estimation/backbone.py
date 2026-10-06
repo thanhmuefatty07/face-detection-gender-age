@@ -29,19 +29,70 @@ except ImportError:
     timm = None
 
 
+class CoordinateAttention(nn.Module):
+    """
+    Coordinate Attention for Efficient Mobile Network Design (Hou et al., CVPR 2021).
+    Encodes channel relationships and long-range dependencies with precise positional
+    information along horizontal (X) and vertical (Y) coordinate directions.
+    
+    Particularly effective for localizing fine facial landmarks and micro-wrinkle
+    patterns (e.g., forehead furrows, crow's feet, nasolabial folds) on Stage 2
+    without diluting directional spatial cues prior to pooling.
+    """
+
+    def __init__(self, in_channels: int, reduction: int = 16):
+        super().__init__()
+        self.in_channels = in_channels
+        self.reduction = reduction
+        mip = max(8, in_channels // reduction)
+
+        self.conv1 = nn.Conv2d(in_channels, mip, kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn1 = nn.BatchNorm2d(mip)
+        self.act = nn.SiLU()
+
+        self.conv_h = nn.Conv2d(mip, in_channels, kernel_size=1, stride=1, padding=0, bias=False)
+        self.conv_w = nn.Conv2d(mip, in_channels, kernel_size=1, stride=1, padding=0, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not torch.jit.is_tracing():
+            if x.shape[2] <= 1 or x.shape[3] <= 1:
+                return x
+
+        identity = x
+        b, c, h, w = x.shape
+
+        # 1D direction-aware pooling along X and Y axes
+        x_h = torch.mean(x, dim=3, keepdim=True)                        # (B, C, H, 1)
+        x_w = torch.mean(x, dim=2, keepdim=True).permute(0, 1, 3, 2)    # (B, C, W, 1)
+
+        # Concatenate along spatial coordinate axis
+        y = torch.cat([x_h, x_w], dim=2)                                # (B, C, H + W, 1)
+        y = self.act(self.bn1(self.conv1(y)))
+
+        # Split back to H and W components
+        x_h_out = y[:, :, :h, :]                                        # (B, mip, H, 1)
+        x_w_out = y[:, :, h:, :].permute(0, 1, 3, 2)                    # (B, mip, 1, W)
+
+        a_h = torch.sigmoid(self.conv_h(x_h_out))                       # (B, C, H, 1)
+        a_w = torch.sigmoid(self.conv_w(x_w_out))                       # (B, C, 1, W)
+
+        return identity * a_h * a_w
+
+
 class MultiScaleBiometricFusion(nn.Module):
     """
-    Multi-Scale Biometric Feature Fusion.
+    Multi-Scale Biometric Feature Fusion with Stage 2 Coordinate Attention.
     
     Extracts and fuses hierarchical spatial features:
-    - Stage 2: (B, C2, 20, 20) -> micro-epidermal textures, wrinkles, and pores
+    - Stage 2: (B, C2, 20, 20) -> Coordinate Attention micro-epidermal textures, wrinkles, and pores
     - Stage 3: (B, C3, 10, 10) -> mesoscopic facial contours and landmarks
     - Stage 4: (B, C4, 5, 5)   -> macro craniofacial bone structure
     
     Processing:
     For stage k in {2, 3, 4}:
-      1. 1x1 Conv projection (C_k -> 128)
-      2. Mixed Dual-Pooling: [AdaptiveAvgPool2d((1, 1)) || AdaptiveMaxPool2d((1, 1))] -> z_k in R^256
+      1. Stage 2 CoordinateAttention (direction-aware X/Y localization)
+      2. 1x1 Conv projection (C_k -> 128)
+      3. Mixed Dual-Pooling: [AdaptiveAvgPool2d((1, 1)) || AdaptiveMaxPool2d((1, 1))] -> z_k in R^256
     
     Fusion:
       [z2 || z3 || z4] in R^768 -> Linear(768, 512) + LayerNorm(512) -> z_fused in R^512
@@ -56,13 +107,16 @@ class MultiScaleBiometricFusion(nn.Module):
         in_channels: Tuple[int, int, int] = (192, 384, 768),
         proj_dim: int = 128,
         fused_dim: int = 512,
+        use_coord_att: bool = True,
     ):
         super().__init__()
         c2, c3, c4 = in_channels
         self.proj_dim = proj_dim
         self.fused_dim = fused_dim
         self.macro_dim = proj_dim * 2  # 256
+        self.use_coord_att = use_coord_att
 
+        self.coord_att2 = CoordinateAttention(c2) if use_coord_att else nn.Identity()
         self.proj2 = nn.Conv2d(c2, proj_dim, kernel_size=1)
         self.proj3 = nn.Conv2d(c3, proj_dim, kernel_size=1)
         self.proj4 = nn.Conv2d(c4, proj_dim, kernel_size=1)
@@ -86,12 +140,13 @@ class MultiScaleBiometricFusion(nn.Module):
     def forward(
         self, stage2: torch.Tensor, stage3: torch.Tensor, stage4: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        z2 = self._pool_stage(stage2, self.proj2)  # (B, 256)
-        z3 = self._pool_stage(stage3, self.proj3)  # (B, 256)
-        z4 = self._pool_stage(stage4, self.proj4)  # (B, 256)
+        stage2_enhanced = self.coord_att2(stage2)
+        z2 = self._pool_stage(stage2_enhanced, self.proj2)  # (B, 256)
+        z3 = self._pool_stage(stage3, self.proj3)          # (B, 256)
+        z4 = self._pool_stage(stage4, self.proj4)          # (B, 256)
 
-        concat_z = torch.cat([z2, z3, z4], dim=-1)  # (B, 768)
-        z_fused = self.fusion(concat_z)              # (B, 512)
+        concat_z = torch.cat([z2, z3, z4], dim=-1)          # (B, 768)
+        z_fused = self.fusion(concat_z)                      # (B, 512)
         return z_fused, z4
 
 

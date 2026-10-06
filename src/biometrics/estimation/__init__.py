@@ -10,13 +10,17 @@ from .dimorphism import (
 )
 from .ldl_engine import (
     ContinuousLDLEngine,
+    get_adaptive_sigma,
     compute_gaussian_ldl,
+    compute_boundary_calibrated_ldl,
+    compute_bc_ldl,
     compute_laplacian_ldl,
     wasserstein_emd_loss,
 )
 from .backbone import (
     BiometricMultiTaskModel,
     MultiScaleBiometricFusion,
+    CoordinateAttention,
     ConvNeXtV2BiometricHead,
     MobileNetV4BiometricHead,
 )
@@ -29,6 +33,8 @@ from .losses import (
     soft_l1_mae_loss,
     masked_dimorphic_bce_loss,
     aleatoric_heteroscedastic_loss,
+    CoupledHeteroscedasticLaplaceLoss,
+    SupervisedContrastiveLoss,
     UnifiedBiometricLoss,
 )
 
@@ -38,11 +44,15 @@ __all__ = [
     "AGE_COHORTS",
     "get_cohort_for_age",
     "ContinuousLDLEngine",
+    "get_adaptive_sigma",
     "compute_gaussian_ldl",
+    "compute_boundary_calibrated_ldl",
+    "compute_bc_ldl",
     "compute_laplacian_ldl",
     "wasserstein_emd_loss",
     "BiometricMultiTaskModel",
     "MultiScaleBiometricFusion",
+    "CoordinateAttention",
     "ConvNeXtV2BiometricHead",
     "MobileNetV4BiometricHead",
     "FaceGoldenDataset",
@@ -51,5 +61,7 @@ __all__ = [
     "soft_l1_mae_loss",
     "masked_dimorphic_bce_loss",
     "aleatoric_heteroscedastic_loss",
+    "CoupledHeteroscedasticLaplaceLoss",
+    "SupervisedContrastiveLoss",
     "UnifiedBiometricLoss",
 ]
