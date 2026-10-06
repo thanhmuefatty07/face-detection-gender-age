@@ -21,6 +21,7 @@ def apply_overexposure_transform(
     gamma: float = 0.5,
     flare_strength: float = 0.6,
     flare_center: Optional[Tuple[int, int]] = None,
+    is_bgr: bool = False,
 ) -> np.ndarray:
     """
     Simulates direct sunlight, harsh specular reflections, and glare.
@@ -33,6 +34,7 @@ def apply_overexposure_transform(
         gamma: compression exponent in [0.4, 0.7]
         flare_strength: flare peak intensity scaling [0.0, 1.0]
         flare_center: optional (x, y) coordinate of flare center
+        is_bgr: True if image is in BGR channel order, False if RGB
     Returns:
         Augmented (H, W, 3) uint8 image
     """
@@ -59,10 +61,12 @@ def apply_overexposure_transform(
     img_flare = np.clip(img_gamma.astype(np.float32) + flare_3ch, 0.0, 255.0).astype(np.uint8)
 
     # 3. CLAHE equalization on luminance channel
-    lab = cv2.cvtColor(img_flare, cv2.COLOR_RGB2LAB)
+    code_to_lab = cv2.COLOR_BGR2LAB if is_bgr else cv2.COLOR_RGB2LAB
+    code_from_lab = cv2.COLOR_LAB2BGR if is_bgr else cv2.COLOR_LAB2RGB
+    lab = cv2.cvtColor(img_flare, code_to_lab)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
     lab[:, :, 0] = clahe.apply(lab[:, :, 0])
-    out = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+    out = cv2.cvtColor(lab, code_from_lab)
 
     return out
 

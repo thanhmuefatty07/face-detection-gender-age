@@ -27,8 +27,11 @@ def cramer_distance_loss(pred_probs: torch.Tensor, target_probs: torch.Tensor) -
     Returns:
         Scalar tensor: mean squared CDF difference
     """
-    cdf_pred = torch.cumsum(pred_probs, dim=-1)
-    cdf_target = torch.cumsum(target_probs, dim=-1)
+    # Guarantee normalized probability simplices
+    p = pred_probs / (torch.sum(pred_probs, dim=-1, keepdim=True) + 1e-12)
+    q = target_probs / (torch.sum(target_probs, dim=-1, keepdim=True) + 1e-12)
+    cdf_pred = torch.cumsum(p, dim=-1)
+    cdf_target = torch.cumsum(q, dim=-1)
     # Sum of squared CDF differences across bins, averaged across batch
     diff_sq = (cdf_pred - cdf_target) ** 2
     return torch.mean(torch.sum(diff_sq, dim=-1))
@@ -63,7 +66,9 @@ def soft_l1_mae_loss(expected_age: torch.Tensor, target_age: torch.Tensor) -> to
     Returns:
         Scalar tensor: MAE loss
     """
-    return torch.mean(torch.abs(expected_age - target_age))
+    exp_flat = expected_age.view(-1)
+    tgt_flat = target_age.view(-1)
+    return torch.mean(torch.abs(exp_flat - tgt_flat))
 
 
 def masked_dimorphic_bce_loss(
@@ -80,15 +85,20 @@ def masked_dimorphic_bce_loss(
     elderly > 65) have attenuated loss penalties.
     
     Args:
-        pred_logits: (B,) unnormalized gender logit (positive = Female)
-        targets: (B,) target gender (1.0 = Female, 0.0 = Male)
-        gender_mask: (B,) validity mask (1.0 = valid, 0.0 = missing/unlabelled)
-        dimorphism_weights: (B,) attenuation weight in [0.2, 1.0]
+        pred_logits: (B,) or (B, 1) unnormalized gender logit (positive = Female)
+        targets: (B,) or (B, 1) target gender (1.0 = Female, 0.0 = Male)
+        gender_mask: (B,) or (B, 1) validity mask (1.0 = valid, 0.0 = missing/unlabelled)
+        dimorphism_weights: (B,) or (B, 1) attenuation weight in [0.2, 1.0]
     Returns:
         Scalar tensor: weighted BCE loss
     """
-    bce = F.binary_cross_entropy_with_logits(pred_logits, targets, reduction="none")
-    effective_weights = gender_mask * dimorphism_weights
+    logits_flat = pred_logits.view(-1)
+    targets_flat = targets.view(-1)
+    mask_flat = gender_mask.view(-1)
+    dim_flat = dimorphism_weights.view(-1)
+
+    bce = F.binary_cross_entropy_with_logits(logits_flat, targets_flat, reduction="none")
+    effective_weights = mask_flat * dim_flat
     total_weight = torch.sum(effective_weights)
 
     if total_weight <= eps:
@@ -112,15 +122,19 @@ def aleatoric_heteroscedastic_loss(
     network to learn dynamic observation noise for noisy, low-quality or ambiguous faces.
     
     Args:
-        expected_age: (B,) continuous prediction
-        target_age: (B,) ground-truth age
-        log_variance: (B,) predicted log-variance s = log(sigma^2)
+        expected_age: (B,) or (B, 1) continuous prediction
+        target_age: (B,) or (B, 1) ground-truth age
+        log_variance: (B,) or (B, 1) predicted log-variance s = log(sigma^2)
     Returns:
         Scalar tensor: heteroscedastic loss
     """
-    residual_sq = (expected_age - target_age) ** 2
+    exp_flat = expected_age.view(-1)
+    tgt_flat = target_age.view(-1)
+    log_var_flat = log_variance.view(-1)
+
+    residual_sq = (exp_flat - tgt_flat) ** 2
     # Clamping log_variance to avoid numerical overflow in exp(-s)
-    s = torch.clamp(log_variance, min=-10.0, max=10.0)
+    s = torch.clamp(log_var_flat, min=-10.0, max=10.0)
     precision = torch.exp(-s)
     loss = 0.5 * precision * residual_sq + 0.5 * s
     return torch.mean(loss)
