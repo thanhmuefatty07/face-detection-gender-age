@@ -22,6 +22,14 @@ from .backbone import (
 from .dataset import (
     FaceGoldenDataset,
 )
+from .losses import (
+    cramer_distance_loss,
+    soft_kl_divergence_loss,
+    soft_l1_mae_loss,
+    masked_dimorphic_bce_loss,
+    aleatoric_heteroscedastic_loss,
+    UnifiedBiometricLoss,
+)
 
 __all__ = [
     "calculate_sexual_dimorphism_weight",
@@ -36,4 +44,10 @@ __all__ = [
     "ConvNeXtV2BiometricHead",
     "MobileNetV4BiometricHead",
     "FaceGoldenDataset",
+    "cramer_distance_loss",
+    "soft_kl_divergence_loss",
+    "soft_l1_mae_loss",
+    "masked_dimorphic_bce_loss",
+    "aleatoric_heteroscedastic_loss",
+    "UnifiedBiometricLoss",
 ]

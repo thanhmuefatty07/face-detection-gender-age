@@ -1552,7 +1552,7 @@ class DiskQuotaManager:
         self,
         working_dir: str = "/kaggle/working",
         max_storage_gb: float = 18.0,
-        min_free_gb: float = 2.5,
+        min_free_gb: float = 1.0,
         shard_image_count: int = 5000,
         archive_format: str = "tar"
     ):

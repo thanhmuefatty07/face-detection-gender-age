@@ -183,14 +183,35 @@ class FaceGoldenDataset(Dataset):
         # Compute 101-bin continuous LDL simplex vector
         ldl_101 = compute_gaussian_ldl(mean_age=age_val, sigma=sigma_val, num_bins=self.num_age_bins)
 
-        # Gender target: 1.0 for Female, 0.0 for Male, -1.0 for unlabelled
-        gender_str = str(row.get("gender", "")).lower()
-        if gender_str in ["female", "f", "1"]:
-            gender_target = 1.0
-        elif gender_str in ["male", "m", "0"]:
-            gender_target = 0.0
-        else:
-            gender_target = float(row.get("gender_prob", 0.5))
+        # Gender target and validity mask:
+        # has_gender is True only if a valid gender annotation exists ('female', 'male', 'f', 'm', '1', '0').
+        # If unlabelled/missing, gender_mask is 0.0 and gender_target defaults to 0.0 to prevent gradient corruption.
+        gender_raw = row.get("gender")
+        has_gender = False
+        gender_target = 0.0
+
+        if gender_raw is not None and not (isinstance(gender_raw, float) and math.isnan(gender_raw)):
+            g_str = str(gender_raw).strip().lower()
+            if g_str in ["female", "f", "1", "1.0"]:
+                has_gender = True
+                gender_target = 1.0
+            elif g_str in ["male", "m", "0", "0.0"]:
+                has_gender = True
+                gender_target = 0.0
+            elif g_str in ["none", "nan", "", "-1", "-1.0", "unknown"]:
+                has_gender = False
+                gender_target = 0.0
+            else:
+                try:
+                    val = float(g_str)
+                    if 0.0 <= val <= 1.0:
+                        has_gender = True
+                        gender_target = 1.0 if val >= 0.5 else 0.0
+                except ValueError:
+                    has_gender = False
+                    gender_target = 0.0
+
+        gender_mask = 1.0 if has_gender else 0.0
 
         dimorphism_w = float(row.get("dimorphism_weight", calculate_sexual_dimorphism_weight(age_val)))
         alpha_w = float(row.get("alpha_sample_weight", 1.0))
@@ -212,6 +233,7 @@ class FaceGoldenDataset(Dataset):
             "ldl_101": torch.from_numpy(ldl_101),                  # (101,) continuous simplex
             "ldl_10": torch.tensor(ldl_10_cohorts, dtype=torch.float32), # (10,) cohort simplex
             "gender": torch.tensor(gender_target, dtype=torch.float32), # 0.0=Male, 1.0=Female
+            "gender_mask": torch.tensor(gender_mask, dtype=torch.float32), # 1.0=Valid gender, 0.0=Ignore in BCE
             "dimorphism_weight": torch.tensor(dimorphism_w, dtype=torch.float32),
             "alpha_sample_weight": torch.tensor(alpha_w, dtype=torch.float32),
             "image_id": image_id,
