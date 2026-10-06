@@ -3,10 +3,10 @@ Biometric Multi-Task Loss Functions
 ====================================
 Unified loss landscape combining:
 1. Cramér Distance (Squared Earth Mover's Distance on ordered 101-bin age CDFs)
-2. Soft-KL Divergence on continuous Gaussian simplex distributions
+2. Soft-KL Divergence on continuous Gaussian simplex distributions (FP16 Underflow Protected)
 3. Soft-L1 MAE Expectation penalty on continuous scalar age
-4. Masked Dimorphic BCE modulated by craniofacial sexual dimorphism weight
-5. Aleatoric Heteroscedastic Uncertainty loss (Kendall & Gal formulation)
+4. Masked Dimorphic BCE modulated by craniofacial sexual dimorphism weight (Sample Count Normalized)
+5. Aleatoric Heteroscedastic Uncertainty loss (L1-Detached Laplace formulation)
 """
 
 from __future__ import annotations
@@ -27,12 +27,10 @@ def cramer_distance_loss(pred_probs: torch.Tensor, target_probs: torch.Tensor) -
     Returns:
         Scalar tensor: mean squared CDF difference
     """
-    # Guarantee normalized probability simplices
-    p = pred_probs / (torch.sum(pred_probs, dim=-1, keepdim=True) + 1e-12)
-    q = target_probs / (torch.sum(target_probs, dim=-1, keepdim=True) + 1e-12)
+    p = pred_probs.float() / (torch.sum(pred_probs.float(), dim=-1, keepdim=True) + 1e-12)
+    q = target_probs.float() / (torch.sum(target_probs.float(), dim=-1, keepdim=True) + 1e-12)
     cdf_pred = torch.cumsum(p, dim=-1)
     cdf_target = torch.cumsum(q, dim=-1)
-    # Sum of squared CDF differences across bins, averaged across batch
     diff_sq = (cdf_pred - cdf_target) ** 2
     return torch.mean(torch.sum(diff_sq, dim=-1))
 
@@ -40,20 +38,27 @@ def cramer_distance_loss(pred_probs: torch.Tensor, target_probs: torch.Tensor) -
 def soft_kl_divergence_loss(
     pred_probs: torch.Tensor,
     target_probs: torch.Tensor,
-    eps: float = 1e-8
+    pred_logits: Optional[torch.Tensor] = None,
+    eps: float = 1e-8,
 ) -> torch.Tensor:
     """
     Kullback-Leibler divergence between predicted simplex and smooth continuous target simplex.
+    Prevents FP16 underflow NaN by using F.log_softmax on float32 logits (when available)
+    or computing log probabilities strictly in float32.
     
     Args:
         pred_probs: (B, K) predicted probabilities
         target_probs: (B, K) continuous target distribution (e.g. Gaussian LDL)
+        pred_logits: Optional (B, K) unnormalized logits for maximum numerical stability
+        eps: numerical epsilon
     Returns:
         Scalar tensor: KL divergence
     """
-    log_pred = torch.log(torch.clamp(pred_probs, min=eps))
-    # F.kl_div expects log-probabilities as input and probabilities as target
-    return F.kl_div(log_pred, target_probs, reduction="batchmean")
+    if pred_logits is not None:
+        log_p = F.log_softmax(pred_logits.float(), dim=-1)
+    else:
+        log_p = torch.log(torch.clamp(pred_probs.float(), min=eps))
+    return F.kl_div(log_p, target_probs.float(), reduction="batchmean")
 
 
 def soft_l1_mae_loss(expected_age: torch.Tensor, target_age: torch.Tensor) -> torch.Tensor:
@@ -66,8 +71,8 @@ def soft_l1_mae_loss(expected_age: torch.Tensor, target_age: torch.Tensor) -> to
     Returns:
         Scalar tensor: MAE loss
     """
-    exp_flat = expected_age.view(-1)
-    tgt_flat = target_age.view(-1)
+    exp_flat = expected_age.float().view(-1)
+    tgt_flat = target_age.float().view(-1)
     return torch.mean(torch.abs(exp_flat - tgt_flat))
 
 
@@ -76,7 +81,7 @@ def masked_dimorphic_bce_loss(
     targets: torch.Tensor,
     gender_mask: torch.Tensor,
     dimorphism_weights: torch.Tensor,
-    eps: float = 1e-8
+    eps: float = 1e-8,
 ) -> torch.Tensor:
     """
     Masked Binary Cross Entropy loss modulated by craniofacial sexual dimorphism weight.
@@ -84,42 +89,46 @@ def masked_dimorphic_bce_loss(
     do not corrupt gender classification, while sexually ambiguous ages (children < 12,
     elderly > 65) have attenuated loss penalties.
     
+    Denominator is strictly normalized by valid_count (sum of mask), avoiding unintended
+    gradient inflation from small dimorphism weights.
+    
     Args:
         pred_logits: (B,) or (B, 1) unnormalized gender logit (positive = Female)
         targets: (B,) or (B, 1) target gender (1.0 = Female, 0.0 = Male)
         gender_mask: (B,) or (B, 1) validity mask (1.0 = valid, 0.0 = missing/unlabelled)
         dimorphism_weights: (B,) or (B, 1) attenuation weight in [0.2, 1.0]
+        eps: epsilon for division stability
     Returns:
         Scalar tensor: weighted BCE loss
     """
-    logits_flat = pred_logits.view(-1)
-    targets_flat = targets.view(-1)
-    mask_flat = gender_mask.view(-1)
-    dim_flat = dimorphism_weights.view(-1)
+    logits_flat = pred_logits.float().view(-1)
+    targets_flat = targets.float().view(-1)
+    mask_flat = gender_mask.float().view(-1)
+    dim_flat = dimorphism_weights.float().view(-1)
 
     bce = F.binary_cross_entropy_with_logits(logits_flat, targets_flat, reduction="none")
-    effective_weights = mask_flat * dim_flat
-    total_weight = torch.sum(effective_weights)
+    valid_count = torch.sum(mask_flat)
 
-    if total_weight <= eps:
+    if valid_count <= eps:
         # If all items in batch are masked out, return zero loss while preserving graph
-        return torch.sum(bce * effective_weights)
+        return torch.sum(bce * 0.0)
 
-    return torch.sum(bce * effective_weights) / (total_weight + eps)
+    return torch.sum(bce * mask_flat * dim_flat) / (valid_count + eps)
 
 
 def aleatoric_heteroscedastic_loss(
     expected_age: torch.Tensor,
     target_age: torch.Tensor,
-    log_variance: torch.Tensor
+    log_variance: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Aleatoric heteroscedastic uncertainty loss (Kendall & Gal 2017).
-    L = 0.5 * exp(-s) * (y - y_hat)^2 + 0.5 * s
-    where s = log(sigma^2).
+    L1-Detached Laplace Aleatoric Uncertainty Loss.
+    L = exp(-s) * |y - y_hat.detach()| + s
+    where s = log_variance.
     
-    Prevents degenerate sigma -> 0 or sigma -> inf solutions while allowing the
-    network to learn dynamic observation noise for noisy, low-quality or ambiguous faces.
+    Detaches predicted continuous age y_hat so that uncertainty learning cannot exploit
+    variance to bias age expectations or cause gradient explosion (||grad|| > 7.5).
+    Formulates residual in L1 (Laplace distribution) for robustness to outliers.
     
     Args:
         expected_age: (B,) or (B, 1) continuous prediction
@@ -128,26 +137,24 @@ def aleatoric_heteroscedastic_loss(
     Returns:
         Scalar tensor: heteroscedastic loss
     """
-    exp_flat = expected_age.view(-1)
-    tgt_flat = target_age.view(-1)
-    log_var_flat = log_variance.view(-1)
+    pred_mu = expected_age.float().view(-1)
+    tgt_flat = target_age.float().view(-1)
+    log_var_flat = log_variance.float().view(-1)
 
-    residual_sq = (exp_flat - tgt_flat) ** 2
-    # Clamping log_variance to avoid numerical overflow in exp(-s)
+    abs_residual = torch.abs(pred_mu.detach() - tgt_flat)
     s = torch.clamp(log_var_flat, min=-10.0, max=10.0)
-    precision = torch.exp(-s)
-    loss = 0.5 * precision * residual_sq + 0.5 * s
-    return torch.mean(loss)
+    loss_unc = torch.mean(torch.exp(-s) * abs_residual + s)
+    return loss_unc
 
 
 class UnifiedBiometricLoss(nn.Module):
     """
     Unified multi-task loss combining:
     - Cramér Distance (squared EMD)
-    - Soft-KL Divergence
+    - Soft-KL Divergence (FP16 protected)
     - Soft-L1 MAE
-    - Masked Dimorphic BCE
-    - Aleatoric Heteroscedastic Uncertainty
+    - Masked Dimorphic BCE (valid-sample normalized)
+    - Aleatoric Heteroscedastic Uncertainty (L1-Detached Laplace)
     """
 
     def __init__(
@@ -176,6 +183,7 @@ class UnifiedBiometricLoss(nn.Module):
         Args:
             preds: dictionary with keys:
                 - 'age_probs': (B, 101)
+                - 'age_logits': Optional (B, 101)
                 - 'expected_age': (B,)
                 - 'gender_logit': (B,)
                 - 'log_variance': (B,)
@@ -191,13 +199,18 @@ class UnifiedBiometricLoss(nn.Module):
         # 1. Cramér Distance
         l_cramer = cramer_distance_loss(preds["age_probs"], targets["ldl_101"])
 
-        # 2. Soft-KL Divergence
-        l_kl = soft_kl_divergence_loss(preds["age_probs"], targets["ldl_101"])
+        # 2. Soft-KL Divergence (FP16 numerical stability via log_softmax)
+        age_logits = preds.get("age_logits")
+        l_kl = soft_kl_divergence_loss(
+            preds["age_probs"],
+            targets["ldl_101"],
+            pred_logits=age_logits
+        )
 
         # 3. Soft-L1 MAE
         l_mae = soft_l1_mae_loss(preds["expected_age"], targets["age_continuous"])
 
-        # 4. Masked Dimorphic BCE
+        # 4. Masked Dimorphic BCE (strictly sample-count normalized)
         gender_mask = targets.get("gender_mask", torch.ones_like(targets["gender"]))
         dimorphism_w = targets.get("dimorphism_weight", torch.ones_like(targets["gender"]))
         l_gender = masked_dimorphic_bce_loss(
@@ -207,7 +220,7 @@ class UnifiedBiometricLoss(nn.Module):
             dimorphism_w
         )
 
-        # 5. Aleatoric Heteroscedastic Loss
+        # 5. Aleatoric Heteroscedastic Loss (L1-Detached Laplace)
         l_aleatoric = aleatoric_heteroscedastic_loss(
             preds["expected_age"],
             targets["age_continuous"],

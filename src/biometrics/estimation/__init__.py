@@ -16,6 +16,7 @@ from .ldl_engine import (
 )
 from .backbone import (
     BiometricMultiTaskModel,
+    MultiScaleBiometricFusion,
     ConvNeXtV2BiometricHead,
     MobileNetV4BiometricHead,
 )
@@ -41,6 +42,7 @@ __all__ = [
     "compute_laplacian_ldl",
     "wasserstein_emd_loss",
     "BiometricMultiTaskModel",
+    "MultiScaleBiometricFusion",
     "ConvNeXtV2BiometricHead",
     "MobileNetV4BiometricHead",
     "FaceGoldenDataset",
