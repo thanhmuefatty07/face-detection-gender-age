@@ -182,9 +182,81 @@ class CloudInferenceClient:
 
         return output_targets
 
-    def render_hud(self, frame: np.ndarray, targets: List[Dict[str, Any]]) -> np.ndarray:
-        """Renders futuristic HUD overlay for locked biometric targets."""
+    def query_cloud(
+        self,
+        local_dets: List[Dict[str, Any]],
+        ws_conn: Any = None,
+    ) -> Tuple[Optional[List[Dict[str, Any]]], float]:
+        """
+        Transmits encoded face crops to Kaggle cloud server and receives biometric predictions.
+        
+        Args:
+            local_dets: list of face detections containing 160x160 crops
+            ws_conn: active persistent WebSocket connection if available
+        Returns:
+            Tuple of (cloud_results, rtt_latency_ms)
+        """
+        if not local_dets:
+            return [], 0.0
+
+        crops_b64 = self.encode_crops(local_dets)
+        if not crops_b64:
+            return [], 0.0
+
+        t0 = time.perf_counter()
+
+        # 1. Active WebSocket persistent connection
+        if ws_conn is not None:
+            try:
+                payload = json.dumps({
+                    "request_id": f"req_{int(time.time() * 1000)}",
+                    "crops": crops_b64,
+                })
+                ws_conn.send(payload)
+                resp_raw = ws_conn.recv(timeout=1.0)
+                resp = json.loads(resp_raw)
+                lat = (time.perf_counter() - t0) * 1000.0
+                return resp.get("results", []), lat
+            except Exception:
+                pass
+
+        # 2. REST HTTP fallback if server_url is http/https
+        if self.server_url.startswith("http://") or self.server_url.startswith("https://"):
+            try:
+                import requests
+                resp = requests.post(
+                    f"{self.server_url.rstrip('/')}/infer",
+                    json={
+                        "request_id": f"req_{int(time.time() * 1000)}",
+                        "crops_base64": crops_b64,
+                    },
+                    timeout=1.0,
+                )
+                lat = (time.perf_counter() - t0) * 1000.0
+                if resp.status_code == 200:
+                    return resp.json().get("results", []), lat
+            except Exception:
+                pass
+
+        return None, 0.0
+
+    def render_hud(
+        self,
+        frame: np.ndarray,
+        targets: List[Dict[str, Any]],
+        fps: float = 0.0,
+        latency_ms: float = 0.0,
+        cloud_connected: bool = True,
+    ) -> np.ndarray:
+        """Renders futuristic HUD overlay for locked biometric targets with telemetry banner."""
         hud_img = frame.copy()
+
+        # Top Telemetry Header
+        header_text = f"FPS: {fps:4.1f} | RTT: {latency_ms:4.1f}ms | Cloud: {'ONLINE' if cloud_connected else 'COASTING'}"
+        cv2.rectangle(hud_img, (10, 10), (320, 34), (20, 20, 20), -1)
+        stat_color = (0, 255, 120) if cloud_connected else (0, 180, 255)
+        cv2.putText(hud_img, header_text, (16, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.45, stat_color, 1, cv2.LINE_AA)
+
         for tgt in targets:
             x1, y1, x2, y2 = [int(v) for v in tgt["bbox"]]
             tid = tgt["track_id"]
@@ -243,34 +315,67 @@ class CloudInferenceClient:
         camera_source: Union[int, str] = 0,
         max_frames: Optional[int] = None,
         display: bool = False,
+        use_cloud: bool = True,
     ) -> Generator[np.ndarray, None, None]:
         """
-        Live physical/synthetic video processing generator.
+        Live physical/synthetic video processing generator with cloud WebSocket tunnel.
         
         Args:
             camera_source: Camera index (0 for iVCam / default USB) or video file path
             max_frames: Optional frame limit
             display: Whether to open cv2.imshow GUI window
+            use_cloud: Whether to transmit crops to Kaggle cloud server
         Yields:
             Processed HUD frame (np.ndarray)
         """
         cap = self.open_camera(camera_source)
         frame_count = 0
 
+        # Attempt to establish persistent WebSocket connection
+        ws_conn = None
+        if use_cloud and (self.server_url.startswith("ws://") or self.server_url.startswith("wss://")):
+            try:
+                from websockets.sync.client import connect
+                ws_conn = connect(self.server_url, open_timeout=2.0)
+            except Exception:
+                ws_conn = None
+
+        t_prev = time.perf_counter()
+        fps = 0.0
+        rtt_lat = 0.0
+
         try:
             while cap.isOpened():
+                t_start = time.perf_counter()
                 ret, frame = cap.read()
                 if not ret or frame is None:
                     break
 
                 frame_count += 1
                 local_dets = self.detect_faces(frame)
-                # In standalone testing, update tracks directly or with cloud mock
-                targets = self.update_local_tracks(local_dets=local_dets, cloud_results=None)
-                hud_frame = self.render_hud(frame, targets)
+
+                cloud_res = None
+                if use_cloud and local_dets:
+                    cloud_res, rtt_lat = self.query_cloud(local_dets, ws_conn=ws_conn)
+
+                targets = self.update_local_tracks(local_dets=local_dets, cloud_results=cloud_res)
+
+                # Compute smoothed FPS
+                dt = time.perf_counter() - t_start
+                if dt > 0:
+                    inst_fps = 1.0 / dt
+                    fps = 0.9 * fps + 0.1 * inst_fps if fps > 0 else inst_fps
+
+                hud_frame = self.render_hud(
+                    frame,
+                    targets,
+                    fps=fps,
+                    latency_ms=rtt_lat,
+                    cloud_connected=(cloud_res is not None or not use_cloud),
+                )
 
                 if display:
-                    cv2.imshow("iVCam Biometric Target Locker HUD", hud_frame)
+                    cv2.imshow("iVCam Biometric Target Locker HUD [Kaggle Cloud GPU]", hud_frame)
                     if cv2.waitKey(1) & 0xFF == 27:  # ESC to quit
                         break
 
@@ -280,5 +385,10 @@ class CloudInferenceClient:
                     break
         finally:
             cap.release()
+            if ws_conn is not None:
+                try:
+                    ws_conn.close()
+                except Exception:
+                    pass
             if display:
                 cv2.destroyAllWindows()
