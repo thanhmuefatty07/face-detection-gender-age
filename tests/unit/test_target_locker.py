@@ -113,3 +113,25 @@ class TestTargetLocker:
         assert len(locker.active_track_ids) == 1
         assert 1 in locker.active_track_ids
         assert 2 not in locker.active_track_ids
+
+    def test_first_frame_initialization_no_doubling(self):
+        """Verifies that the first observation is not double-counted on creation."""
+        locker = TargetLocker()
+        res = locker.update(track_id=1, age_pred=35.0, aleatoric_std=1.5, gender_logit=2.0)
+        assert pytest.approx(res["log_odds"], abs=1e-3) == 2.0
+        assert pytest.approx(res["locked_age"], abs=1e-3) == 35.0
+
+    def test_coasting_without_measurement_does_not_pollute(self):
+        """Verifies that occluded frames preserve biometric estimate without pulling towards 25.0."""
+        locker = TargetLocker()
+        locker.update(track_id=1, age_pred=65.0, aleatoric_std=1.0, gender_logit=3.0)
+
+        # Coast for 5 frames without measurement
+        for _ in range(5):
+            res = locker.coast(track_id=1)
+
+        # Age must remain at 65.0, NOT pulled towards 25.0!
+        assert pytest.approx(res["locked_age"], abs=1e-3) == 65.0
+        assert res["locked_gender"] == "Female"
+        # Gender log-odds leaked naturally: 3.0 * (0.95^5) ~ 2.32
+        assert pytest.approx(res["log_odds"], rel=1e-2) == 3.0 * (0.95 ** 5)

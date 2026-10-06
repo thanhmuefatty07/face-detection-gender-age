@@ -47,6 +47,12 @@ class TestEnvironmentalTransforms:
         # Flare should create saturated highlights (255)
         assert (augmented >= 250).sum() > 0
 
+    def test_overexposure_transform_bgr(self, base_face_image):
+        augmented_bgr = apply_overexposure_transform(base_face_image, gamma=0.5, flare_strength=0.7, is_bgr=True)
+        assert augmented_bgr.shape == (160, 160, 3)
+        assert augmented_bgr.dtype == np.uint8
+        assert augmented_bgr.mean() > base_face_image.mean()
+
     def test_underexposure_backlight_transform(self, base_face_image):
         augmented = apply_underexposure_backlight_transform(
             base_face_image, gamma=2.2, noise_sigma=10.0

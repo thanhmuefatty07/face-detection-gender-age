@@ -357,6 +357,7 @@ class ByteTracker:
         for d in unmatched_dets_high_remaining:
             if len(active_ids) < self.max_targets:
                 new_track = STrack(bbox=d.bbox, score=d.score, reid_feat=d.reid_feat, det_id=d.det_id)
+                new_track.last_detection = d
                 new_stracks.append(new_track)
                 active_ids.add(new_track.track_id)
 

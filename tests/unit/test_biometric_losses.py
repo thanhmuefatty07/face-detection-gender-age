@@ -106,6 +106,17 @@ class TestMaskedDimorphicBCELoss:
         assert pred_logits.grad[0].item() != 0.0
         assert pred_logits.grad[2].item() != 0.0
 
+    def test_shape_mismatch_broadcasting_protection(self):
+        """Ensures (B, 1) logits against (B,) targets does not create (B, B) matrix broadcasting."""
+        pred_logits = torch.tensor([[2.0], [-1.0], [0.5]])  # Shape (3, 1)
+        targets = torch.tensor([1.0, 0.0, 1.0])              # Shape (3,)
+        mask = torch.tensor([[1.0], [1.0], [1.0]])           # Shape (3, 1)
+        dimorphism = torch.tensor([1.0, 0.8, 0.9])           # Shape (3,)
+
+        loss = masked_dimorphic_bce_loss(pred_logits, targets, mask, dimorphism)
+        assert loss.ndim == 0
+        assert not torch.isnan(loss)
+
 
 class TestAleatoricUncertaintyLoss:
     def test_loss_penalizes_high_residual_with_low_variance(self):
