@@ -282,3 +282,121 @@ class TestByteTrackerGatedMatching:
         # Person B MUST NOT steal Person A's track_id! It must be assigned a new ID!
         assert len(tracks3) == 1
         assert tracks3[0].track_id != tid_a, "Fatal ID Swap: Person B stole Person A track ID despite appearance mismatch!"
+
+
+class TestSOTAEdgeCasesAndExport:
+    """Verifies edge case robustness and hardware deployment export."""
+
+    def test_supcon_fp16_amp_execution(self):
+        """FP16 embeddings under AMP should compute safely without CPU Half addmm crash."""
+        supcon = SupervisedContrastiveLoss(temperature=0.07)
+        emb_fp16 = torch.randn(8, 64, dtype=torch.float16, requires_grad=True)
+        labels = torch.tensor([0, 0, 1, 1, 2, 2, 3, 3])
+
+        loss = supcon(emb_fp16, labels)
+        loss.backward()
+
+        assert not torch.isnan(loss)
+        assert emb_fp16.grad is not None
+        assert not torch.isnan(emb_fp16.grad).any()
+
+    def test_supcon_negative_labels_unlabeled_isolation(self):
+        """Samples with label -1 (unlabeled) must NEVER pair with each other."""
+        supcon = SupervisedContrastiveLoss(temperature=0.07)
+        emb = torch.randn(4, 64, requires_grad=True)
+        # 2 unlabeled samples (-1, -1) and 2 distinct IDs (0, 1) -> NO valid positive pairs!
+        labels = torch.tensor([-1, -1, 0, 1])
+
+        loss = supcon(emb, labels)
+        assert pytest.approx(loss.item(), abs=1e-6) == 0.0
+
+    def test_boundary_transition_continuity_no_jumps(self):
+        """No artificial step discontinuities across boundary transitions (e.g. age 4.9 -> 5.0)."""
+        engine = ContinuousLDLEngine(num_bins=101)
+        for a in [4.0, 4.5, 4.9, 5.0, 5.1, 5.5, 6.0, 94.0, 94.9, 95.0, 95.1, 96.0]:
+            dist = compute_gaussian_ldl(mean_age=a, sigma=2.5, num_bins=101)
+            exp_a = engine.expected_age(dist)
+            assert abs(exp_a - a) <= 0.0002, f"Discontinuity at age {a}: expected {a}, got {exp_a:.6f}"
+
+    def test_batched_alpha_sample_weight_scaling(self):
+        """Batched alpha_sample_weight (B,) scales total loss by batch mean rather than falling back to 1.0."""
+        criterion = UnifiedBiometricLoss(weight_reid=0.15)
+        B = 4
+        age_logits = torch.randn(B, 101)
+        age_probs = torch.softmax(age_logits, dim=-1)
+        expected_age = torch.sum(age_probs * torch.arange(101, dtype=torch.float32), dim=-1)
+
+        preds = {
+            "age_probs": age_probs,
+            "age_logits": age_logits,
+            "expected_age": expected_age,
+            "gender_logit": torch.randn(B),
+            "log_variance": torch.randn(B),
+            "reid_embedding": torch.randn(B, 64),
+        }
+        targets = {
+            "ldl_101": torch.softmax(torch.randn(B, 101), dim=-1),
+            "age_continuous": torch.tensor([20.0, 30.0, 40.0, 50.0]),
+            "gender": torch.tensor([1.0, 0.0, 1.0, 0.0]),
+            "identity": torch.tensor([0, 0, 1, 1]),
+            "alpha_sample_weight": torch.tensor([2.0, 2.0, 2.0, 2.0]),  # 2.0x scale
+        }
+
+        total_loss_2x, _ = criterion(preds, targets)
+
+        # Baseline with 1.0x weights
+        targets_1x = dict(targets)
+        targets_1x["alpha_sample_weight"] = torch.tensor([1.0, 1.0, 1.0, 1.0])
+        total_loss_1x, _ = criterion(preds, targets_1x)
+
+        assert pytest.approx(total_loss_2x.item(), rel=1e-3) == total_loss_1x.item() * 2.0
+
+    def test_unified_loss_with_fp16_reid_embedding(self):
+        """UnifiedBiometricLoss gracefully handles FP16 reid_embedding without throwing."""
+        criterion = UnifiedBiometricLoss(weight_reid=0.15)
+        B = 4
+        preds = {
+            "age_probs": torch.softmax(torch.randn(B, 101), dim=-1),
+            "age_logits": torch.randn(B, 101),
+            "expected_age": torch.tensor([20.0, 25.0, 30.0, 35.0]),
+            "gender_logit": torch.randn(B),
+            "log_variance": torch.randn(B),
+            "reid_embedding": torch.randn(B, 64, dtype=torch.float16),  # Half precision
+        }
+        targets = {
+            "ldl_101": torch.softmax(torch.randn(B, 101), dim=-1),
+            "age_continuous": torch.tensor([20.0, 25.0, 30.0, 35.0]),
+            "gender": torch.tensor([1.0, 0.0, 1.0, 0.0]),
+            "identity": torch.tensor([0, 0, 1, 1]),
+        }
+        total_loss, metrics = criterion(preds, targets)
+        assert not torch.isnan(total_loss)
+        assert metrics["loss_reid"] >= 0.0
+
+    def test_torchscript_and_onnx_export_compatibility(self):
+        """BiometricMultiTaskModel must trace cleanly into TorchScript and export to ONNX."""
+        import io
+        model = BiometricMultiTaskModel(backbone_name="convnextv2_nano", pretrained=False)
+        model.eval()
+        x = torch.randn(1, 3, 160, 160)
+
+        # TorchScript tracing
+        traced = torch.jit.trace(model, x)
+        outputs = traced(x)
+        assert len(outputs) == 4
+        assert outputs[0].shape == (1, 101)  # age_logits
+        assert outputs[1].shape == (1,)      # gender_logit
+        assert outputs[2].shape == (1,)      # log_var
+        assert outputs[3].shape == (1, 64)   # reid_emb
+
+        # ONNX export
+        buf = io.BytesIO()
+        torch.onnx.export(
+            model, x, buf,
+            input_names=["input"],
+            output_names=["age_logits", "gender_logit", "log_variance", "reid_embedding"],
+            dynamic_axes={"input": {0: "batch"}},
+            opset_version=14
+        )
+        assert len(buf.getvalue()) > 1000
+

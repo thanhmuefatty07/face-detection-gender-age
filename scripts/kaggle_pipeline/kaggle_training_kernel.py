@@ -72,8 +72,9 @@ def compute_gaussian_ldl(mean_age: float, sigma: float = 2.5, num_bins: int = 10
     q = np.maximum(q, 1e-12)
     q /= np.sum(q)
 
-    # Boundary moment calibration for infant & geriatric edges
-    if mean_age < 5.0 or mean_age > (K - 5.0):
+    # Boundary moment calibration for infant & geriatric edges (eliminates boundary distortion)
+    cur_mean = float(np.sum(bins * q))
+    if abs(cur_mean - mean_age) > 1e-4:
         lam = 0.0
         p = q.copy()
         for _ in range(25):
@@ -182,6 +183,16 @@ class FaceGoldenDataset(Dataset):
         teacher_mu = float(row.get("teacher_age_mu", age_val))
         teacher_sigma = float(row.get("teacher_age_sigma", 2.5))
 
+        # Identity / Subject ID for Re-ID Contrastive Learning
+        identity_val = -1
+        for id_col in ["identity", "subject_id", "person_id", "identity_id"]:
+            if id_col in row and pd.notna(row.get(id_col)):
+                try:
+                    identity_val = int(row.get(id_col))
+                    break
+                except (ValueError, TypeError):
+                    pass
+
         return {
             "image": tensor_img,
             "ldl_101": torch.from_numpy(ldl_101),
@@ -192,6 +203,7 @@ class FaceGoldenDataset(Dataset):
             "alpha_sample_weight": torch.tensor(alpha_w, dtype=torch.float32),
             "teacher_age_mu": torch.tensor(teacher_mu, dtype=torch.float32),
             "teacher_age_sigma": torch.tensor(teacher_sigma, dtype=torch.float32),
+            "identity": torch.tensor(identity_val, dtype=torch.long),
         }
 
 # 4. Multi-Scale Architecture with Stage 2 Coordinate Attention
@@ -273,6 +285,10 @@ class BiometricMultiTaskModel(nn.Module):
         reid_emb = F.normalize(self.reid_head(z4), p=2, dim=-1)
         expected_age = torch.sum(age_probs * torch.arange(101, device=x.device, dtype=torch.float32), dim=-1)
 
+        # Export compatibility
+        if torch.jit.is_tracing():
+            return age_logits, gender_logit, log_var, reid_emb
+
         return {
             "age_logits": age_logits,
             "age_probs": age_probs,
@@ -282,7 +298,25 @@ class BiometricMultiTaskModel(nn.Module):
             "reid_embedding": reid_emb
         }
 
-# 5. Supervised Contrastive Loss & Unified Biometric Loss
+# 5. Coupled Heteroscedastic Laplace Loss, SupCon & Unified Biometric Loss
+class CoupledHeteroscedasticLaplaceLoss(nn.Module):
+    def __init__(self, delta: float = 1.0, min_log_var: float = -10.0, max_log_var: float = 10.0):
+        super().__init__()
+        self.delta, self.min_log_var, self.max_log_var = delta, min_log_var, max_log_var
+
+    def forward(self, expected_age, target_age, log_variance, sample_weights=None):
+        mu = expected_age.float().view(-1)
+        target = target_age.float().view(-1)
+        s = torch.clamp(log_variance.float().view(-1), self.min_log_var, self.max_log_var)
+        huber = F.huber_loss(mu, target, delta=self.delta, reduction="none")
+        loss = torch.exp(-s) * huber + s
+        if sample_weights is not None:
+            w = sample_weights.float().view(-1)
+            valid_w = torch.sum(w)
+            if valid_w > 1e-8:
+                return torch.sum(loss * w) / (valid_w + 1e-8)
+        return torch.mean(loss)
+
 class SupervisedContrastiveLoss(nn.Module):
     def __init__(self, temperature: float = 0.07):
         super().__init__()
@@ -293,14 +327,16 @@ class SupervisedContrastiveLoss(nn.Module):
         B = embeddings.shape[0]
         if B <= 1 or labels is None:
             return torch.sum(embeddings * 0.0)
-        norm_emb = F.normalize(embeddings, p=2, dim=-1)
+        norm_emb = F.normalize(embeddings.float(), p=2, dim=-1)
         labels = labels.contiguous().view(-1, 1)
-        pos_mask = torch.eq(labels, labels.T).float()
+        valid_labels = (labels >= 0).float()
+        pos_mask = torch.eq(labels, labels.T).float() * (valid_labels @ valid_labels.T)
         diag_mask = torch.scatter(torch.ones_like(pos_mask), 1, torch.arange(B, device=device).view(-1, 1), 0.0)
         pos_mask = pos_mask * diag_mask
 
         sim = torch.div(torch.matmul(norm_emb, norm_emb.T), self.temperature)
-        sim_max, _ = torch.max(sim, dim=1, keepdim=True)
+        sim_off_diag = sim - (1.0 - diag_mask) * 1e9
+        sim_max, _ = torch.max(sim_off_diag, dim=1, keepdim=True)
         logits = sim - sim_max.detach()
         denom = torch.log((torch.exp(logits) * diag_mask).sum(1, keepdim=True) + 1e-12)
         log_prob = logits - denom
@@ -315,6 +351,7 @@ class UnifiedBiometricLoss(nn.Module):
         super().__init__()
         self.w_cramer, self.w_kl, self.w_mae, self.w_gender, self.w_unc, self.w_reid = w_cramer, w_kl, w_mae, w_gender, w_unc, w_reid
         self.supcon = SupervisedContrastiveLoss(temperature=reid_temp)
+        self.coupled_laplace = CoupledHeteroscedasticLaplaceLoss()
 
     def forward(self, preds, targets):
         p = preds["age_probs"].float() / (preds["age_probs"].float().sum(-1, keepdim=True) + 1e-12)
@@ -332,27 +369,28 @@ class UnifiedBiometricLoss(nn.Module):
         valid_cnt = torch.sum(mask)
         l_gender = torch.sum(bce * mask * dim_w) / (valid_cnt + 1e-8) if valid_cnt > 0 else torch.sum(bce * 0.0)
 
-        res = torch.abs(preds["expected_age"].detach().float() - targets["age_continuous"].float())
-        s = torch.clamp(preds["log_variance"].float(), -10.0, 10.0)
-        l_unc = torch.mean(torch.exp(-s) * res + s)
+        # Coupled Heteroscedastic Laplace Loss with Huber bounds
+        sample_w = targets.get("alpha_sample_weight", None)
+        l_unc = self.coupled_laplace(preds["expected_age"], targets["age_continuous"], preds["log_variance"], sample_weights=sample_w)
 
         # Re-ID Head Supervised Contrastive Loss (forms genuine biometric clusters)
         reid_emb = preds.get("reid_embedding")
         if reid_emb is not None:
             id_labels = targets.get("identity", targets.get("reid_label", None))
-            if id_labels is None and "age_continuous" in targets and "gender" in targets:
+            has_valid_id = id_labels is not None and (id_labels >= 0).any()
+            if has_valid_id:
+                l_reid = self.supcon(reid_emb, id_labels)
+            elif "age_continuous" in targets and "gender" in targets and self.w_reid > 0:
                 cohort = (targets["age_continuous"] / 5.0).long() * 2 + (targets["gender"] >= 0.5).long()
                 l_reid = self.supcon(reid_emb, cohort)
-            elif id_labels is not None:
-                l_reid = self.supcon(reid_emb, id_labels)
             else:
                 l_reid = torch.sum(reid_emb * 0.0)
         else:
             l_reid = torch.tensor(0.0, device=p.device)
 
-        # Teacher Alpha Sample Weighting
+        # Teacher Alpha Sample Weighting (supports scalar or batched tensor)
         alpha_w = targets.get("alpha_sample_weight", None)
-        alpha_scale = float(alpha_w.item()) if (alpha_w is not None and alpha_w.numel() == 1) else 1.0
+        alpha_scale = torch.mean(alpha_w.float().view(-1)) if (alpha_w is not None and alpha_w.numel() > 0) else 1.0
 
         total = (self.w_cramer * l_cramer + self.w_kl * l_kl + self.w_mae * l_mae + self.w_gender * l_gender + self.w_unc * l_unc + self.w_reid * l_reid) * alpha_scale
         return total, {"cramer": l_cramer.item(), "kl": l_kl.item(), "mae": l_mae.item(), "gender": l_gender.item(), "unc": l_unc.item(), "reid": l_reid.item()}

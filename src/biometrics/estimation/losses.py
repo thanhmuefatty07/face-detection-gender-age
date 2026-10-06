@@ -224,12 +224,13 @@ class SupervisedContrastiveLoss(nn.Module):
         if B <= 1 or labels is None:
             return torch.sum(embeddings * 0.0)
 
-        # Ensure unit L2 normalization
-        norm_emb = F.normalize(embeddings, p=2, dim=-1)
+        # Ensure float32 precision for numerical stability across CPU/GPU
+        norm_emb = F.normalize(embeddings.float(), p=2, dim=-1)
 
         labels = labels.contiguous().view(-1, 1)
-        # Pairwise label equality mask: (B, B)
-        label_mask = torch.eq(labels, labels.T).float()
+        # Pairwise label equality mask: (B, B), only valid non-negative labels can pair
+        valid_labels = (labels >= 0).float()
+        label_mask = torch.eq(labels, labels.T).float() * (valid_labels @ valid_labels.T)
 
         # Mask out self-contrast (diagonal)
         diag_mask = torch.scatter(
@@ -240,11 +241,12 @@ class SupervisedContrastiveLoss(nn.Module):
         )
         pos_mask = label_mask * diag_mask
 
-        # Compute dot product similarities scaled by temperature
+        # Compute dot product similarities scaled by temperature in FP32
         sim = torch.div(torch.matmul(norm_emb, norm_emb.T), self.temperature)
 
-        # Subtract max for numerical stability
-        sim_max, _ = torch.max(sim, dim=1, keepdim=True)
+        # Subtract max over valid off-diagonal pairs for exact numerical stability
+        sim_off_diag = sim - (1.0 - diag_mask) * 1e9
+        sim_max, _ = torch.max(sim_off_diag, dim=1, keepdim=True)
         logits = sim - sim_max.detach()
 
         # Denominator over all pairs except self
@@ -384,9 +386,13 @@ class UnifiedBiometricLoss(nn.Module):
         else:
             l_reid = torch.tensor(0.0, device=preds["age_probs"].device if "age_probs" in preds else "cpu")
 
-        # Optional teacher alpha sample weighting scalar
+        # Optional teacher alpha sample weighting (supports scalar or batched tensor)
         alpha_w = targets.get("alpha_sample_weight", None)
-        alpha_scale = float(alpha_w.item()) if (alpha_w is not None and alpha_w.numel() == 1) else 1.0
+        if alpha_w is not None:
+            alpha_tensor = alpha_w.float().view(-1)
+            alpha_scale = torch.mean(alpha_tensor) if alpha_tensor.numel() > 0 else 1.0
+        else:
+            alpha_scale = 1.0
 
         # Weighted total
         total_loss = (

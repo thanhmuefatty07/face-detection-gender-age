@@ -347,13 +347,18 @@ class BiometricMultiTaskModel(nn.Module):
             nn.LayerNorm(reid_dim)
         )
 
-    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_dict: Optional[bool] = None,
+    ) -> Dict[str, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass with multi-scale fusion and head routing separation.
         Args:
             x: Aligned face tensor (B, 3, 160, 160)
+            return_dict: If False or when torch.jit tracing, returns tuple of tensors for clean export.
         Returns:
-            Dictionary containing predictions:
+            Dictionary (default in Python) or Tuple (when tracing / export):
             - 'age_logits': (B, 101)
             - 'age_probs': (B, 101) probability simplex
             - 'expected_age': (B,) scalar continuous expectation
@@ -402,6 +407,10 @@ class BiometricMultiTaskModel(nn.Module):
         # Continuous age expectation
         age_bins = torch.arange(self.num_age_bins, device=x.device, dtype=torch.float32)
         expected_age = torch.sum(age_probs * age_bins, dim=-1)
+
+        # Export compatibility: return tuple for TorchScript and ONNX
+        if torch.jit.is_tracing() or return_dict is False:
+            return age_logits, gender_logit, log_var, reid_emb
 
         return {
             "age_logits": age_logits,

@@ -102,8 +102,9 @@ def compute_boundary_calibrated_ldl(
     q = np.maximum(q, 1e-12)
     q /= np.sum(q)
 
-    # Boundary calibration if in boundary regions
-    if mean_age < 5.0 or mean_age > (K - 5.0):
+    # Boundary calibration if expectation deviates from mean_age due to boundary truncation
+    cur_mean = float(np.sum(bins * q))
+    if abs(cur_mean - mean_age) > 1e-4:
         q = _boundary_calibrate_distribution(q, mean_age)
 
     # Final simplex guarantee
@@ -127,10 +128,11 @@ def compute_gaussian_ldl(
     Guarantees sum(p) == 1.0 (simplex conservation).
     
     When boundary_calibrate=True (default), uses BC-LDL near boundaries
-    (age < 5 or age > 95) to fold truncated mass and guarantee expectation matches
-    target age within +/- 0.0001 (e.g., 1.0000 for age 1.0).
+    (age < 3*sigma or age > 100 - 3*sigma) to fold truncated mass and guarantee expectation
+    matches target age within +/- 0.0001 (e.g., exactly 1.0000 for age 1.0) with zero jumps.
     """
-    if boundary_calibrate and (mean_age < 5.0 or mean_age > (num_bins - 1 - 5.0)):
+    boundary_span = max(5.0, 3.0 * float(sigma))
+    if boundary_calibrate and (mean_age < boundary_span or mean_age > (num_bins - 1 - boundary_span)):
         return compute_boundary_calibrated_ldl(mean_age=mean_age, sigma=sigma, num_bins=num_bins)
 
     sigma = max(sigma, 0.5)
