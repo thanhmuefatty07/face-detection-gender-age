@@ -1,8 +1,9 @@
 # Models (Large files)
-# models/*.pt
-# models/*.onnx
-# models/*.pth
+models/*.pt
+models/*.onnx
+models/*.pth
 !models/.gitkeep
+kernel.errors.txt
 
 # Dataset - DO NOT UPLOAD (too large ~16k files)
 images/
