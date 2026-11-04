@@ -8,4 +8,4 @@ Pillow>=9.0.0
 PyYAML>=6.0
 
 # Hardware Acceleration (CPU AVX2 / Intel iGPU)
-openvino>=2024.0.0
+openvino>=2024.0.0; python_version < '3.14'

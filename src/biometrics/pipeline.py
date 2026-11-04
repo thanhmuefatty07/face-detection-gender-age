@@ -23,8 +23,7 @@ from .detection.scrfd_detector import SCRFDFaceDetector
 from .estimation.ldl_engine import ContinuousLDLEngine, compute_gaussian_ldl
 from .estimation.dimorphism import calculate_sexual_dimorphism_weight, get_cohort_for_age
 from .runtime import HardwareResourceManager, EnvironmentNormalizer
-from ..mining.filtering.quality_auditor import ExtremeQualityAuditor
-from ..mining.filtering.deduplicator import compute_64bit_dct_phash
+from .core.quality import ExtremeQualityAuditor, compute_64bit_dct_phash
 
 
 class BiometricPipeline:

@@ -40,10 +40,10 @@ class CloudInferenceClient:
         self,
         server_url: str = "ws://localhost:8000/ws/infer",
         max_targets: int = 16,
-        track_thresh: float = 0.6,
+        track_thresh: float = 0.5,
         low_thresh: float = 0.2,
         yunet_model_path: Optional[str | Path] = None,
-        target_size: int = 160,
+        target_size: int = 224,
         enable_local_fallback: bool = False,
         device: str = "auto",
     ):
@@ -84,7 +84,7 @@ class CloudInferenceClient:
                 use_openvino=hw_cfg["use_openvino"],
                 device=self.device,
                 target_size=self.target_size,
-                enable_flip_tta=(hw_cfg["torch_device"] == "cuda"),
+                enable_flip_tta=True,
             )
         return self._local_edge
 
@@ -173,6 +173,49 @@ class CloudInferenceClient:
                 crops_b64.append(base64.b64encode(enc.tobytes()).decode("utf-8"))
         return crops_b64
 
+    def _all_detections_match_locked_tracks(
+        self,
+        local_dets: List[Dict[str, Any]],
+        iou_thresh: float = 0.45,
+    ) -> bool:
+        """
+        Returns True if every detection in `local_dets` unambiguously matches a distinct
+        active track that already has a locked first-shot biometric measurement, and no
+        lost tracks are awaiting ReID recovery.
+        """
+        if not local_dets:
+            return True
+        if len(self.tracker.lost_tracks) > 0:
+            return False
+        if len(self.tracker.tracked_tracks) < len(local_dets):
+            return False
+
+        used_track_ids = set()
+        for ld in local_dets:
+            b = ld.get("bbox", (0.0, 0.0, 0.0, 0.0))
+            best_iou = iou_thresh
+            best_tid = None
+            for t in self.tracker.tracked_tracks:
+                if t.track_id in used_track_ids:
+                    continue
+                if t.track_id not in self.locker._measured_tracks:
+                    continue
+                xx1 = max(t.bbox[0], b[0])
+                yy1 = max(t.bbox[1], b[1])
+                xx2 = min(t.bbox[2], b[2])
+                yy2 = min(t.bbox[3], b[3])
+                inter = max(0.0, xx2 - xx1) * max(0.0, yy2 - yy1)
+                area_t = max(0.0, t.bbox[2] - t.bbox[0]) * max(0.0, t.bbox[3] - t.bbox[1])
+                area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+                iou = inter / (area_t + area_b - inter + 1e-8)
+                if iou >= best_iou:
+                    best_iou = iou
+                    best_tid = t.track_id
+            if best_tid is None:
+                return False
+            used_track_ids.add(best_tid)
+        return True
+
     def update_local_tracks(
         self,
         local_dets: List[Dict[str, Any]],
@@ -180,8 +223,17 @@ class CloudInferenceClient:
     ) -> List[Dict[str, Any]]:
         """
         Associates cloud/local predictions with local detections and updates tracker & locker.
-        Guarantees that occluded tracks coast stably without corrupting biometric filters.
+        Guarantees that the first target lock is immediately measured and subsequent frames stay rock-solid.
         """
+        if (
+            cloud_results is None
+            and self.enable_local_fallback
+            and local_dets
+            and not self._all_detections_match_locked_tracks(local_dets)
+            and any(ld.get("crop") is not None for ld in local_dets)
+        ):
+            cloud_results = self.infer_locally(local_dets)
+
         tracker_dets: List[Detection] = []
         for i, ld in enumerate(local_dets):
             bbox = ld.get("bbox", (0.0, 0.0, 0.0, 0.0))
@@ -327,23 +379,23 @@ class CloudInferenceClient:
         latency_ms: float = 0.0,
         cloud_connected: bool = True,
         mode_label: Optional[str] = None,
+        show_telemetry: bool = False,
     ) -> np.ndarray:
-        """Renders futuristic HUD overlay for locked biometric targets with telemetry banner."""
+        """Renders clean HUD overlay displaying ONLY Gender and Age Range on locked target boxes."""
         hud_img = frame.copy()
 
-        status_str = mode_label or ("ONLINE" if cloud_connected else "COASTING")
-        header_text = f"FPS: {fps:4.1f} | Infer: {latency_ms:4.1f}ms | Targets: {len(targets)} | Mode: {status_str}"
-        (hw, _), _ = cv2.getTextSize(header_text, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
-        cv2.rectangle(hud_img, (10, 10), (max(320, hw + 26), 34), (20, 20, 20), -1)
-        stat_color = (0, 255, 120) if cloud_connected else (0, 180, 255)
-        cv2.putText(hud_img, header_text, (16, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.45, stat_color, 1, cv2.LINE_AA)
+        if show_telemetry:
+            status_str = mode_label or ("ONLINE" if cloud_connected else "COASTING")
+            header_text = f"FPS: {fps:4.1f} | Infer: {latency_ms:4.1f}ms | Targets: {len(targets)} | Mode: {status_str}"
+            (hw, _), _ = cv2.getTextSize(header_text, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+            cv2.rectangle(hud_img, (10, 10), (max(320, hw + 26), 34), (20, 20, 20), -1)
+            stat_color = (0, 255, 120) if cloud_connected else (0, 180, 255)
+            cv2.putText(hud_img, header_text, (16, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.45, stat_color, 1, cv2.LINE_AA)
 
         for tgt in targets:
             x1, y1, x2, y2 = [int(v) for v in tgt["bbox"]]
-            tid = tgt["track_id"]
             age = tgt["locked_age"]
             gender = tgt["locked_gender"]
-            std = tgt.get("aleatoric_std", 1.0)
 
             color = (200, 50, 220) if gender == "Female" else (240, 180, 40)
 
@@ -356,17 +408,17 @@ class CloudInferenceClient:
 
             from ..estimation.intervals import get_fine_interval_for_age
             age_iv = tgt.get("locked_age_interval") or get_fine_interval_for_age(age)[0]
-            label = f"ID #{tid} | {gender} | {age_iv}y ({age:.1f}y +/-{std:.1f})"
-            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-            cv2.rectangle(hud_img, (x1, max(0, y1 - th - 8)), (x1 + tw + 6, max(0, y1)), color, -1)
+            label = f"{gender} | {age_iv}"
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+            cv2.rectangle(hud_img, (x1, max(0, y1 - th - 10)), (x1 + tw + 10, max(0, y1)), color, -1)
             cv2.putText(
                 hud_img,
                 label,
-                (x1 + 3, max(0, y1 - 4)),
+                (x1 + 5, max(0, y1 - 5)),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
+                0.55,
                 (255, 255, 255),
-                1,
+                2,
                 cv2.LINE_AA,
             )
 
@@ -374,7 +426,8 @@ class CloudInferenceClient:
 
     def open_camera(self, camera_source: Union[int, str] = "auto") -> cv2.VideoCapture:
         """
-        Opens camera capture stream with automatic multi-backend port discovery & failover.
+        Opens camera capture stream with automatic multi-backend port discovery & failover
+        across Windows (DirectShow/MSMF), macOS (AVFoundation), and Linux (V4L2).
         """
         with suppress_opencv_logs():
             if isinstance(camera_source, str) and camera_source.strip().lower() in ("auto", "scan", "default", ""):
@@ -382,19 +435,25 @@ class CloudInferenceClient:
                 if best.is_opened and isinstance(best.port, int):
                     cap = cv2.VideoCapture(best.port, best.backend_id) if best.backend_id != 0 else cv2.VideoCapture(best.port)
                 else:
-                    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-                    if not cap.isOpened():
+                    cap = None
+                    for _, backend_id in CameraPortScanner.get_platform_backends():
+                        cap = cv2.VideoCapture(0, backend_id) if backend_id != 0 else cv2.VideoCapture(0)
+                        if cap is not None and cap.isOpened():
+                            break
+                    if cap is None:
                         cap = cv2.VideoCapture(0)
             elif isinstance(camera_source, int):
-                cap = cv2.VideoCapture(camera_source, cv2.CAP_DSHOW)
-                if not cap.isOpened():
-                    cap = cv2.VideoCapture(camera_source, getattr(cv2, "CAP_MSMF", 1400))
-                if not cap.isOpened():
-                    cap = cv2.VideoCapture(camera_source)
-                if not cap.isOpened():
+                cap = None
+                for _, backend_id in CameraPortScanner.get_platform_backends():
+                    cap = cv2.VideoCapture(camera_source, backend_id) if backend_id != 0 else cv2.VideoCapture(camera_source)
+                    if cap is not None and cap.isOpened():
+                        break
+                if cap is None or not cap.isOpened():
                     best = CameraPortScanner.find_best_camera_port("auto")
                     if best.is_opened and isinstance(best.port, int):
                         cap = cv2.VideoCapture(best.port, best.backend_id) if best.backend_id != 0 else cv2.VideoCapture(best.port)
+                    elif cap is None:
+                        cap = cv2.VideoCapture(camera_source)
             else:
                 cap = cv2.VideoCapture(str(camera_source))
 
@@ -418,6 +477,7 @@ class CloudInferenceClient:
         """
         Live video processing generator with zero-lag threaded camera capture,
         automatic port discovery, cloud WebSocket tunnel, and local EdgeAsyncPipeline fallback.
+        Locks targets on first acquisition and skips redundant re-inference once locked.
         """
         stream = ThreadedCameraStream(
             camera_source=camera_source,
@@ -437,7 +497,6 @@ class CloudInferenceClient:
         fps = 0.0
         rtt_lat = 0.0
         has_local_edge_active = False
-        last_det_count = 0
 
         try:
             while stream.isOpened():
@@ -451,36 +510,23 @@ class CloudInferenceClient:
 
                 cloud_res = None
                 mode_label = "COASTING"
-                if use_cloud and local_dets:
+                if use_cloud and local_dets and not self._all_detections_match_locked_tracks(local_dets):
                     cloud_res, rtt_lat = self.query_cloud(local_dets, ws_conn=ws_conn)
                     if cloud_res is not None:
                         mode_label = "CLOUD-GPU"
 
-                # Automatic local Edge inference when cloud is disabled or unreachable
+                # Automatic local Edge inference ONLY for newly appearing/unlocked targets
                 if cloud_res is None and self.enable_local_fallback and local_dets:
-                    all_tracks_measured = (
-                        len(self.tracker.tracked_tracks) > 0
-                        and all(
-                            t.track_id in self.locker._measured_tracks
-                            for t in self.tracker.tracked_tracks
-                        )
-                    )
                     need_fresh_infer = (
                         not has_local_edge_active
-                        or not all_tracks_measured
-                        or len(local_dets) != last_det_count
-                        or (frame_count % max(1, infer_interval) == 1)
+                        or not self._all_detections_match_locked_tracks(local_dets)
                     )
                     if need_fresh_infer:
                         t_inf = time.perf_counter()
                         cloud_res = self.infer_locally(local_dets)
                         rtt_lat = (time.perf_counter() - t_inf) * 1000.0
                         has_local_edge_active = True
-                        last_det_count = len(local_dets)
                     else:
-                        # On skipped frames, do NOT re-apply positional cached_results (which would
-                        # swap identities if detection order changes and double-count Kalman updates).
-                        # Passing cloud_res=None updates spatial track boxes while coasting Kalman states.
                         cloud_res = None
                     mode_label = f"LOCAL-EDGE (Port {stream.port_info.port})"
 

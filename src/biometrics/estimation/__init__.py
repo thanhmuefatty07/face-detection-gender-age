@@ -28,24 +28,6 @@ from .backbone import (
     ConvNeXtV2BiometricHead,
     MobileNetV4BiometricHead,
 )
-from .dataset import (
-    FaceGoldenDataset,
-)
-from .losses import (
-    cramer_distance_loss,
-    soft_kl_divergence_loss,
-    soft_l1_mae_loss,
-    interval_censored_ordinal_loss,
-    fine_interval_ldl_loss,
-    ldl_tikhonov_smoothness_loss,
-    photometric_consistency_loss,
-    masked_dimorphic_bce_loss,
-    aleatoric_heteroscedastic_loss,
-    CoupledHeteroscedasticLaplaceLoss,
-    SupervisedContrastiveLoss,
-    UnifiedBiometricLoss,
-)
-
 __all__ = [
     "calculate_sexual_dimorphism_weight",
     "calculate_ethnic_aging_offset",
@@ -67,18 +49,44 @@ __all__ = [
     "PhotometricRetinexStem",
     "ConvNeXtV2BiometricHead",
     "MobileNetV4BiometricHead",
-    "FaceGoldenDataset",
-    "cramer_distance_loss",
-    "soft_kl_divergence_loss",
-    "soft_l1_mae_loss",
-    "interval_censored_ordinal_loss",
-    "fine_interval_ldl_loss",
-    "ldl_tikhonov_smoothness_loss",
-    "photometric_consistency_loss",
-    "masked_dimorphic_bce_loss",
-    "aleatoric_heteroscedastic_loss",
-    "CoupledHeteroscedasticLaplaceLoss",
-    "SupervisedContrastiveLoss",
-    "UnifiedBiometricLoss",
 ]
+
+try:
+    from .dataset import FaceGoldenDataset
+    __all__.append("FaceGoldenDataset")
+except Exception:
+    pass
+
+try:
+    from .losses import (
+        cramer_distance_loss,
+        soft_kl_divergence_loss,
+        soft_l1_mae_loss,
+        interval_censored_ordinal_loss,
+        fine_interval_ldl_loss,
+        ldl_tikhonov_smoothness_loss,
+        photometric_consistency_loss,
+        masked_dimorphic_bce_loss,
+        aleatoric_heteroscedastic_loss,
+        CoupledHeteroscedasticLaplaceLoss,
+        SupervisedContrastiveLoss,
+        UnifiedBiometricLoss,
+    )
+    __all__.extend([
+        "cramer_distance_loss",
+        "soft_kl_divergence_loss",
+        "soft_l1_mae_loss",
+        "interval_censored_ordinal_loss",
+        "fine_interval_ldl_loss",
+        "ldl_tikhonov_smoothness_loss",
+        "photometric_consistency_loss",
+        "masked_dimorphic_bce_loss",
+        "aleatoric_heteroscedastic_loss",
+        "CoupledHeteroscedasticLaplaceLoss",
+        "SupervisedContrastiveLoss",
+        "UnifiedBiometricLoss",
+    ])
+except Exception:
+    pass
+
 

@@ -96,6 +96,26 @@ class HardwareResourceManager:
                     physical = max(1, len(cores_set))
             except Exception:
                 pass
+        elif sys.platform == "darwin":
+            try:
+                res_phys = subprocess.run(
+                    ["sysctl", "-n", "hw.physicalcpu"],
+                    capture_output=True,
+                    text=True,
+                    timeout=1.5,
+                )
+                if res_phys.returncode == 0 and res_phys.stdout.strip().isdigit():
+                    physical = max(1, int(res_phys.stdout.strip()))
+                res_log = subprocess.run(
+                    ["sysctl", "-n", "hw.logicalcpu"],
+                    capture_output=True,
+                    text=True,
+                    timeout=1.5,
+                )
+                if res_log.returncode == 0 and res_log.stdout.strip().isdigit():
+                    logical = max(1, int(res_log.stdout.strip()))
+            except Exception:
+                pass
 
         return {
             "logical_cores": logical,
@@ -148,6 +168,44 @@ class HardwareResourceManager:
                 mem_load_pct = int(max(0.0, min(100.0, (1.0 - avail_ram_mb / float(max(1, total_ram_mb))) * 100.0)))
             except Exception:
                 pass
+        elif sys.platform == "darwin":
+            try:
+                res_mem = subprocess.run(
+                    ["sysctl", "-n", "hw.memsize"],
+                    capture_output=True,
+                    text=True,
+                    timeout=1.5,
+                )
+                if res_mem.returncode == 0 and res_mem.stdout.strip().isdigit():
+                    total_ram_mb = max(256, int(res_mem.stdout.strip()) // (1024 * 1024))
+                    avail_ram_mb = max(128, int(total_ram_mb * 0.6))
+                res_vm = subprocess.run(
+                    ["vm_stat"],
+                    capture_output=True,
+                    text=True,
+                    timeout=1.5,
+                )
+                if res_vm.returncode == 0 and res_vm.stdout:
+                    page_size = 16384
+                    free_pages = 0
+                    for line in res_vm.stdout.splitlines():
+                        if "page size of" in line:
+                            for tok in line.split():
+                                if tok.isdigit():
+                                    page_size = int(tok)
+                                    break
+                        elif any(
+                            line.startswith(k)
+                            for k in ("Pages free:", "Pages inactive:", "Pages speculative:")
+                        ):
+                            val_str = line.split(":")[-1].strip().rstrip(".")
+                            if val_str.isdigit():
+                                free_pages += int(val_str)
+                    if free_pages > 0:
+                        avail_ram_mb = max(128, min(total_ram_mb, (free_pages * page_size) // (1024 * 1024)))
+                mem_load_pct = int(max(0.0, min(100.0, (1.0 - avail_ram_mb / float(max(1, total_ram_mb))) * 100.0)))
+            except Exception:
+                pass
 
         vram_total_mb = 0
         gpu_name = "None"
@@ -158,6 +216,21 @@ class HardwareResourceManager:
                 gpu_name = str(props.name)
             except Exception:
                 pass
+        elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            gpu_name = "Apple Silicon MPS"
+            vram_total_mb = total_ram_mb
+            if sys.platform == "darwin":
+                try:
+                    res_cpu = subprocess.run(
+                        ["sysctl", "-n", "machdep.cpu.brand_string"],
+                        capture_output=True,
+                        text=True,
+                        timeout=1.5,
+                    )
+                    if res_cpu.returncode == 0 and res_cpu.stdout.strip():
+                        gpu_name = f"{res_cpu.stdout.strip()} (MPS)"
+                except Exception:
+                    pass
 
         if vram_total_mb >= 4096 or avail_ram_mb >= 4096:
             optimal_batch = 16
@@ -801,6 +874,28 @@ class CameraPortScanner:
                                 names.append(f"{dev_dir.name}: {n}")
             except Exception:
                 pass
+        elif sys.platform == "darwin":
+            try:
+                res = subprocess.run(
+                    ["system_profiler", "SPCameraDataType"],
+                    capture_output=True,
+                    text=True,
+                    timeout=3.0,
+                )
+                if res.returncode == 0 and res.stdout:
+                    for line in res.stdout.splitlines():
+                        stripped = line.strip()
+                        if (
+                            stripped.endswith(":")
+                            and not stripped.startswith("Camera:")
+                            and not stripped.startswith("Model ID:")
+                            and not stripped.startswith("Unique ID:")
+                        ):
+                            cam_name = stripped[:-1].strip()
+                            if cam_name and cam_name not in names:
+                                names.append(cam_name)
+            except Exception:
+                pass
         return names
 
     @classmethod
@@ -903,13 +998,18 @@ class CameraPortScanner:
         first_frame: Optional[np.ndarray] = None
         last_frame: Optional[np.ndarray] = None
         read_ok = False
-        for _ in range(max(1, warmup_frames)):
+        max_reads = max(1, warmup_frames)
+        if backend_name == "AVFOUNDATION":
+            max_reads = max(max_reads, 8)
+        for i in range(max_reads):
             ret, frm = cap.read()
             if ret and frm is not None and frm.size > 0 and frm.ndim == 3:
                 read_ok = True
                 if first_frame is None:
                     first_frame = frm.copy()
                 last_frame = frm
+                if i >= max(1, warmup_frames) - 1 and float(np.std(frm)) > 2.0:
+                    break
 
         if not read_ok or last_frame is None:
             return CameraPortInfo(
@@ -953,7 +1053,7 @@ class CameraPortScanner:
             score += 12.0
         if w >= 640 and h >= 480:
             score += 5.0
-        if backend_name == "DSHOW":
+        if backend_name in ("DSHOW", "AVFOUNDATION", "V4L2"):
             score += 3.0
 
         return CameraPortInfo(

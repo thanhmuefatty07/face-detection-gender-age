@@ -47,8 +47,8 @@ class KalmanBoxTracker:
 
     def __init__(self, bbox: Tuple[float, float, float, float]):
         self.x = np.array([bbox[0], bbox[1], bbox[2], bbox[3], 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
-        self.P = np.eye(8, dtype=np.float32) * 10.0
-        self.P[4:, 4:] *= 100.0
+        self.P = np.eye(8, dtype=np.float32) * 2.0
+        self.P[4:, 4:] = np.eye(4, dtype=np.float32) * 10.0
 
         self.F = np.eye(8, dtype=np.float32)
         for i in range(4):
@@ -57,12 +57,13 @@ class KalmanBoxTracker:
         self.H = np.zeros((4, 8), dtype=np.float32)
         self.H[:4, :4] = np.eye(4, dtype=np.float32)
 
-        self.Q = np.eye(8, dtype=np.float32) * 1.0
-        self.Q[4:, 4:] *= 0.1
+        self.Q = np.eye(8, dtype=np.float32) * 0.5
+        self.Q[4:, 4:] = np.eye(4, dtype=np.float32) * 0.05
 
-        self.R = np.eye(4, dtype=np.float32) * 5.0
+        self.R = np.eye(4, dtype=np.float32) * 3.0
 
     def predict(self) -> Tuple[float, float, float, float]:
+        self.x[4:] *= 0.70
         self.x = self.F @ self.x
         self.P = self.F @ self.P @ self.F.T + self.Q
         return float(self.x[0]), float(self.x[1]), float(self.x[2]), float(self.x[3])
@@ -70,6 +71,9 @@ class KalmanBoxTracker:
     def update(self, bbox: Tuple[float, float, float, float]):
         z = np.array(bbox, dtype=np.float32)
         y = z - self.H @ self.x
+        if float(np.max(np.abs(y))) < 1.5:
+            y = y * 0.25
+            self.x[4:] *= 0.25
         S = self.H @ self.P @ self.H.T + self.R
         try:
             K = self.P @ self.H.T @ np.linalg.pinv(S)
@@ -254,7 +258,7 @@ class ByteTracker:
 
     def __init__(
         self,
-        track_thresh: float = 0.6,
+        track_thresh: float = 0.5,
         low_thresh: float = 0.2,
         reid_thresh: float = 0.35,
         max_time_lost: int = 30,

@@ -35,7 +35,7 @@ from src.biometrics.runtime import CameraPortScanner, HardwareResourceManager
 
 def print_camera_scan_report(max_index: int = 6):
     print("=" * 72)
-    print("🔍 Đang quét các cổng Camera khả dụng (DirectShow / MSMF / V4L2)...")
+    print("🔍 Đang quét các cổng Camera khả dụng (DirectShow / MSMF / AVFoundation / V4L2)...")
     os_names = CameraPortScanner.enumerate_os_camera_names()
     if os_names:
         print(f"📋 Thiết bị phần cứng phát hiện từ HĐH: {', '.join(os_names)}")

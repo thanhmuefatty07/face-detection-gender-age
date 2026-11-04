@@ -124,7 +124,7 @@ class EdgeAsyncPipeline:
         self.locker = TargetLocker()
 
     def _init_openvino(self, target_device: str = "CPU"):
-        """Initializes and compiles OpenVINO execution engine with optimal CPU/GPU properties."""
+        """Initializes and compiles OpenVINO execution engine with persistent IR & blob caching."""
         try:
             core = ov.Core()
             available = list(core.available_devices)
@@ -132,17 +132,38 @@ class EdgeAsyncPipeline:
             if ov_dev not in available:
                 ov_dev = "CPU" if "CPU" in available else (available[0] if available else "CPU")
 
-            # Enable persistent disk cache only when loading a deterministic checkpoint file
+            cache_dir: Optional[Path] = None
+            cached_xml: Optional[Path] = None
             if self._loaded_checkpoint_path is not None:
                 cache_dir = self._loaded_checkpoint_path.parent / ".ov_cache"
                 try:
                     cache_dir.mkdir(parents=True, exist_ok=True)
                     core.set_property({"CACHE_DIR": str(cache_dir)})
+                    ckpt_sz = self._loaded_checkpoint_path.stat().st_size
+                    cached_xml = cache_dir / f"{self.backbone_name}_{self.target_size}_{ckpt_sz}.xml"
                 except Exception:
-                    pass
+                    cached_xml = None
 
-            dummy = torch.zeros(1, 3, self.target_size, self.target_size, device=self.torch_device)
-            ov_model = ov.convert_model(self.model, example_input=dummy)
+            ov_model = None
+            if cached_xml is not None and cached_xml.exists() and cached_xml.with_suffix(".bin").exists():
+                try:
+                    ov_model = core.read_model(str(cached_xml))
+                except Exception:
+                    ov_model = None
+
+            if ov_model is None:
+                dummy = torch.zeros(1, 3, self.target_size, self.target_size, device=self.torch_device)
+                ov_model = ov.convert_model(self.model, example_input=dummy)
+                if cached_xml is not None:
+                    try:
+                        ov_model.inputs[0].get_node().set_partial_shape(
+                            ov.PartialShape([-1, 3, self.target_size, self.target_size])
+                        )
+                        ov_model.validate_nodes_and_infer_types()
+                        ov.save_model(ov_model, str(cached_xml))
+                    except Exception:
+                        pass
+
             if ov_dev == "CPU":
                 ov_model.inputs[0].get_node().set_partial_shape(
                     ov.PartialShape([-1, 3, self.target_size, self.target_size])
@@ -178,6 +199,31 @@ class EdgeAsyncPipeline:
                 return [np.array(v, dtype=np.float32, copy=True) for v in ov_out.values()]
         ov_out = self.ov_compiled_model(inp)
         return [np.asarray(v, dtype=np.float32) for v in ov_out.values()]
+
+    @staticmethod
+    def _focused_expected_age_np(probs: np.ndarray, bins_vec: np.ndarray) -> np.ndarray:
+        """
+        Computes mode-focused expected age from 101-bin distribution, suppressing
+        distant asymmetric tail leakage so first-shot predictions do not drift across
+        adjacent 3-5 year interval boundaries.
+        """
+        raw_exp = np.sum(probs * bins_vec[None, :], axis=-1, keepdims=True)
+        if probs.shape[-1] < 5:
+            return raw_exp.squeeze(-1)
+        pad_p = np.pad(probs, ((0, 0), (2, 2)), mode="edge")
+        smooth_p = (
+            0.10 * pad_p[:, :-4]
+            + 0.20 * pad_p[:, 1:-3]
+            + 0.40 * pad_p[:, 2:-2]
+            + 0.20 * pad_p[:, 3:-1]
+            + 0.10 * pad_p[:, 4:]
+        )
+        peak_bins = np.argmax(smooth_p, axis=-1, keepdims=True).astype(np.float32)
+        center = 0.55 * peak_bins + 0.45 * raw_exp
+        window = np.exp(-0.5 * ((bins_vec[None, :] - center) / 8.5) ** 2)
+        p_focus = (probs ** 1.25) * (0.10 + 0.90 * window)
+        p_focus = p_focus / np.clip(np.sum(p_focus, axis=-1, keepdims=True), 1e-12, None)
+        return np.sum(p_focus * bins_vec[None, :], axis=-1)
 
     def detect_faces(self, frame: np.ndarray) -> List[Dict[str, Any]]:
         """
@@ -233,12 +279,12 @@ class EdgeAsyncPipeline:
                     exp_l = np.exp(logits_shift)
                     probs_cat = exp_l / np.clip(np.sum(exp_l, axis=-1, keepdims=True), 1e-12, None)
                     bins_vec = np.arange(probs_cat.shape[-1], dtype=np.float32)
-                    expected_cat = np.sum(probs_cat * bins_vec[None, :], axis=-1)
+                    expected_cat = self._focused_expected_age_np(probs_cat, bins_vec)
                     std_cat = np.exp(0.5 * lv_cat)
 
                     probs_avg = 0.5 * (probs_cat[:N] + probs_cat[N:])
                     probs_avg = probs_avg / np.clip(np.sum(probs_avg, axis=-1, keepdims=True), 1e-12, None)
-                    age_preds = np.sum(probs_avg * bins_vec[None, :], axis=-1).flatten().tolist()
+                    age_preds = self._focused_expected_age_np(probs_avg, bins_vec).flatten().tolist()
 
                     var_orig = std_cat[:N] ** 2
                     var_flip = std_cat[N:] ** 2
@@ -272,7 +318,7 @@ class EdgeAsyncPipeline:
                     exp_l = np.exp(logits_shift)
                     probs = exp_l / np.clip(np.sum(exp_l, axis=-1, keepdims=True), 1e-12, None)
                     bins_vec = np.arange(probs.shape[-1], dtype=np.float32)
-                    age_preds = np.sum(probs * bins_vec[None, :], axis=-1).flatten().tolist()
+                    age_preds = self._focused_expected_age_np(probs, bins_vec).flatten().tolist()
                     std_preds = np.exp(0.5 * lv_arr).flatten().tolist()
                     g_logits = g_arr.flatten().tolist()
                     reid_norm = reid_arr / np.clip(np.linalg.norm(reid_arr, axis=-1, keepdims=True), 1e-12, None)
@@ -295,11 +341,11 @@ class EdgeAsyncPipeline:
 
         if isinstance(out, (tuple, list)):
             age_logits, gender_logit, log_var, reid_t = out[0], out[1], out[2], out[3]
-            age_ldl_t = torch.softmax(age_logits, dim=-1)
-            bins_t = torch.arange(age_ldl_t.shape[-1], device=age_ldl_t.device, dtype=age_ldl_t.dtype)
-            exp_age_t = torch.sum(age_ldl_t * bins_t.unsqueeze(0), dim=-1).reshape(-1)
+            age_ldl_t = torch.softmax(age_logits, dim=-1).cpu().numpy()
+            bins_np = np.arange(age_ldl_t.shape[-1], dtype=np.float32)
+            exp_age_np = self._focused_expected_age_np(age_ldl_t, bins_np)
             std_t = torch.exp(0.5 * torch.clamp(log_var.reshape(-1), -6.0, 4.0))
-            age_preds = exp_age_t.cpu().numpy().flatten().tolist()
+            age_preds = exp_age_np.flatten().tolist()
             std_preds = std_t.cpu().numpy().flatten().tolist()
             g_logits = gender_logit.reshape(-1).cpu().numpy().flatten().tolist()
             reid_arr = reid_t.cpu().numpy()
@@ -340,26 +386,70 @@ class EdgeAsyncPipeline:
             all_reids.extend(reids)
         return all_ages, all_stds, all_g_logits, all_reids
 
+    def _match_locked_tracks_by_iou(
+        self,
+        det_boxes: List[Tuple[float, float, float, float]],
+    ) -> Dict[int, Any]:
+        """
+        Identifies detections that unambiguously match an already-locked active track
+        (IoU >= 0.45, no competing detections or lost tracks) so we do not re-run
+        redundant neural inference on already-locked targets.
+        """
+        if not det_boxes or not self.tracker.tracked_tracks or len(self.tracker.lost_tracks) > 0:
+            return {}
+        if not all(t.track_id in self.locker._measured_tracks for t in self.tracker.tracked_tracks):
+            return {}
+
+        matched: Dict[int, Any] = {}
+        used_track_ids = set()
+        for d_idx, d_box in enumerate(det_boxes):
+            best_iou = 0.45
+            best_trk = None
+            second_iou = 0.0
+            for trk in self.tracker.tracked_tracks:
+                t_box = trk.bbox
+                xx1 = max(t_box[0], d_box[0])
+                yy1 = max(t_box[1], d_box[1])
+                xx2 = min(t_box[2], d_box[2])
+                yy2 = min(t_box[3], d_box[3])
+                inter = max(0.0, xx2 - xx1) * max(0.0, yy2 - yy1)
+                area_t = max(0.0, t_box[2] - t_box[0]) * max(0.0, t_box[3] - t_box[1])
+                area_d = max(0.0, d_box[2] - d_box[0]) * max(0.0, d_box[3] - d_box[1])
+                iou = inter / (area_t + area_d - inter + 1e-8)
+                if iou > best_iou:
+                    second_iou = best_iou if best_trk is not None else second_iou
+                    best_iou = iou
+                    best_trk = trk
+                elif iou > second_iou:
+                    second_iou = iou
+
+            if best_trk is not None and second_iou < 0.20 and best_trk.track_id not in used_track_ids:
+                matched[d_idx] = best_trk
+                used_track_ids.add(best_trk.track_id)
+            else:
+                return {}
+        return matched
+
     def process_frame(self, frame: np.ndarray) -> List[Dict[str, Any]]:
         """
         Processes a single video frame locally across multiple targets and lighting environments.
-        Guarantees strict 1-to-1 biometric alignment without cross-track contamination.
-        
-        Args:
-            frame: (H, W, 3) BGR image
-        Returns:
-            List of locked biometric target dictionaries
+        Acquires an immediate 1-shot lock on new targets and skips redundant neural inference
+        on already-locked targets to prevent frame jumping.
         """
         if frame is None or frame.size == 0 or frame.ndim != 3:
             return []
         H, W = frame.shape[:2]
         raw_dets = self.detect_faces(frame)
 
+        locked_det_map = self._match_locked_tracks_by_iou([d["bbox"] for d in raw_dets])
+
         crops: List[np.ndarray] = []
         valid_det_indices: List[int] = []
         env_unc_multipliers: List[float] = []
 
         for i, d in enumerate(raw_dets):
+            if i in locked_det_map:
+                continue
             crop_rgb = None
             lmks = d.get("landmarks")
             if lmks is not None:
@@ -405,6 +495,8 @@ class EdgeAsyncPipeline:
             if det_i in crop_index_by_det:
                 c_idx = crop_index_by_det[det_i]
                 rf = reid_feats[c_idx] if c_idx < len(reid_feats) else None
+            elif det_i in locked_det_map:
+                rf = locked_det_map[det_i].reid_feat
             tracker_dets.append(Detection(
                 bbox=d["bbox"],
                 score=d["score"],
@@ -457,7 +549,7 @@ class EdgeAsyncPipeline:
                 has_meas = True
             else:
                 age_val = 25.0
-                std_val = 1.0
+                std_val = float(self.locker._initial_stds.get(t.track_id, 1.0))
                 g_logit = 0.0
                 has_meas = False
 

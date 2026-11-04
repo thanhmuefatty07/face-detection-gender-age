@@ -29,8 +29,8 @@ class EpistemicAgeKalmanFilter:
         self,
         initial_age: float = 25.0,
         initial_std: float = 1.0,
-        process_noise_q: float = 0.05,
-        huber_delta: float = 6.0,
+        process_noise_q: float = 0.01,
+        huber_delta: float = 2.5,
     ):
         safe_age = float(initial_age) if math.isfinite(float(initial_age)) else 25.0
         safe_std = float(initial_std) if (math.isfinite(float(initial_std)) and float(initial_std) > 0.0) else 1.0
@@ -41,7 +41,7 @@ class EpistemicAgeKalmanFilter:
 
     def predict(self) -> float:
         """Coasting step when no measurement is received."""
-        self.var = self.var + self.q
+        self.var = min(4.0, self.var + self.q)
         return self.age
 
     def update(self, measured_age: float, aleatoric_std: float) -> float:
@@ -66,7 +66,7 @@ class EpistemicAgeKalmanFilter:
         clamped_meas = float(np.clip(float(measured_age), 0.0, 100.0))
         innovation = clamped_meas - self.age
 
-        # Huber-Kalman robust innovation gating against extreme multi-frame spikes
+        # Huber-Kalman robust innovation gating against multi-frame spikes
         innov_std = math.sqrt(p_pred + r)
         threshold = self.huber_delta * innov_std
         if self.huber_delta > 0.0 and abs(innovation) > threshold:
@@ -94,7 +94,7 @@ class BoundedLeakyGenderAccumulator:
 
     def __init__(
         self,
-        decay: float = 0.95,
+        decay: float = 0.98,
         min_bound: float = -6.0,
         max_bound: float = 6.0,
         initial_logit: float = 0.0,
@@ -106,8 +106,7 @@ class BoundedLeakyGenderAccumulator:
         self.log_odds = float(np.clip(safe_logit, self.min_bound, self.max_bound))
 
     def predict(self) -> float:
-        """Leaky decay step when no new evidence is observed."""
-        self.log_odds = self.decay * self.log_odds
+        """Holds log-odds steady during coasting frames when no new measurement is observed."""
         self.log_odds = float(np.clip(self.log_odds, self.min_bound, self.max_bound))
         return self.log_odds
 
@@ -140,25 +139,30 @@ class BoundedLeakyGenderAccumulator:
 class TargetLocker:
     """
     Manages continuous biometric state locking for active video tracks.
-    Maintains persistent Kalman filters, Bayesian accumulators, and 23-bracket
-    hysteresis deadbands per track_id.
+    Acquires an immediate one-shot lock on the first valid measurement and holds
+    the locked gender and 3-5 year age interval steady without post-lock jumping.
     """
 
     def __init__(
         self,
-        gender_decay: float = 0.95,
+        gender_decay: float = 0.98,
         gender_bounds: float = 6.0,
-        age_process_noise: float = 0.05,
-        interval_hysteresis_margin: float = 0.35,
+        age_process_noise: float = 0.005,
+        interval_hysteresis_margin: float = 2.5,
+        lock_on_first_shot: bool = True,
     ):
         self.gender_decay = gender_decay
         self.gender_bounds = gender_bounds
         self.age_process_noise = age_process_noise
         self.interval_hysteresis_margin = float(interval_hysteresis_margin)
+        self.lock_on_first_shot = bool(lock_on_first_shot)
 
         self.age_filters: Dict[int, EpistemicAgeKalmanFilter] = {}
         self.gender_accumulators: Dict[int, BoundedLeakyGenderAccumulator] = {}
         self.locked_intervals: Dict[int, int] = {}
+        self.locked_genders: Dict[int, str] = {}
+        self._initial_stds: Dict[int, float] = {}
+        self._candidate_counts: Dict[int, Tuple[int, int]] = {}
         self._measured_tracks: Set[int] = set()
 
     @property
@@ -176,22 +180,8 @@ class TargetLocker:
     ) -> Dict[str, Any]:
         """
         Updates continuous biometric target lock for a specified track.
-        
-        Args:
-            track_id: unique persistent tracker identity ID
-            age_pred: raw instantaneous expected age
-            aleatoric_std: raw predicted uncertainty std
-            gender_logit: raw predicted gender logit
-            has_measurement: whether a real detection was matched to this track in current frame
-        Returns:
-            Dictionary with locked biometric attributes:
-            - 'locked_age': continuous smoothed age (zero flicker)
-            - 'locked_age_interval': 3-5 year hysteresis-stabilized bracket string
-            - 'locked_age_interval_idx': 3-5 year bracket index [0..22]
-            - 'locked_age_bounds': (low, high) integer bounds
-            - 'locked_gender': stable gender string ('Male' or 'Female')
-            - 'gender_prob': posterior confidence in Female [0.0, 1.0]
-            - 'log_odds': current log-odds accumulator value
+        Locks immediately on the first valid measurement ("một phát ăn ngay") and
+        prevents post-lock interval/gender jumping across subsequent frames.
         """
         from ..estimation.intervals import FINE_AGE_INTERVALS, get_fine_interval_for_age
 
@@ -207,43 +197,85 @@ class TargetLocker:
         g_weight = min(1.0, (2.0 / safe_std) ** 2) if valid_measurement else 1.0
 
         if is_new_track or is_first_measurement:
+            anchor_std = max(0.15, min(0.50, 0.20 * safe_std)) if valid_measurement else 1.0
             self.age_filters[track_id] = EpistemicAgeKalmanFilter(
                 initial_age=age_pred if valid_measurement else 25.0,
-                initial_std=aleatoric_std if valid_measurement else 1.0,
+                initial_std=anchor_std,
                 process_noise_q=self.age_process_noise,
             )
+            if valid_measurement:
+                raw_g = float(gender_logit) * g_weight
+                if abs(raw_g) > 1e-5 and abs(raw_g) < 3.0:
+                    init_logit = math.copysign(max(3.0, abs(raw_g)), raw_g)
+                else:
+                    init_logit = raw_g
+            else:
+                init_logit = 0.0
+
             self.gender_accumulators[track_id] = BoundedLeakyGenderAccumulator(
                 decay=self.gender_decay,
                 min_bound=-self.gender_bounds,
                 max_bound=self.gender_bounds,
-                initial_logit=(float(gender_logit) * g_weight) if valid_measurement else 0.0,
+                initial_logit=init_logit,
             )
-            if valid_measurement:
-                self._measured_tracks.add(track_id)
             locked_age = self.age_filters[track_id].age
             log_odds = self.gender_accumulators[track_id].log_odds
+            iv_name, iv_idx, iv_low, iv_high = get_fine_interval_for_age(locked_age)
+            gender_label = self.gender_accumulators[track_id].label
+            if valid_measurement:
+                self._measured_tracks.add(track_id)
+                self.locked_intervals[track_id] = iv_idx
+                self.locked_genders[track_id] = gender_label
+                self._initial_stds[track_id] = safe_std
+                self._candidate_counts.pop(track_id, None)
+            elif track_id not in self.locked_intervals:
+                self.locked_intervals[track_id] = iv_idx
+                self.locked_genders[track_id] = gender_label
         else:
             if valid_measurement:
-                locked_age = self.age_filters[track_id].update(age_pred, aleatoric_std)
-                log_odds = self.gender_accumulators[track_id].update(float(gender_logit) * g_weight)
+                locked_age = self.age_filters[track_id].update(age_pred, max(safe_std * 2.5, 2.0))
+                log_odds = self.gender_accumulators[track_id].update(float(gender_logit) * g_weight * 0.25)
             else:
                 locked_age = self.age_filters[track_id].predict()
                 log_odds = self.gender_accumulators[track_id].predict()
 
-        gender_prob = self.gender_accumulators[track_id].probability
-        gender_label = self.gender_accumulators[track_id].label
-        iv_name, iv_idx, iv_low, iv_high = get_fine_interval_for_age(locked_age)
+            iv_name, iv_idx, iv_low, iv_high = get_fine_interval_for_age(locked_age)
+            gender_label = self.gender_accumulators[track_id].label
 
-        # Apply 23-bracket hysteresis deadband to prevent boundary oscillation
-        if not (is_new_track or is_first_measurement) and track_id in self.locked_intervals and self.interval_hysteresis_margin > 0.0:
-            prev_idx = self.locked_intervals[track_id]
-            if prev_idx != iv_idx and 0 <= prev_idx < len(FINE_AGE_INTERVALS):
+            if track_id in self.locked_intervals:
+                prev_idx = self.locked_intervals[track_id]
                 prev_name, prev_low, prev_high = FINE_AGE_INTERVALS[prev_idx]
-                # Retention band around previous interval [prev_low - 0.5 - margin, prev_high + 0.5 + margin]
-                if (prev_low - 0.5 - self.interval_hysteresis_margin) <= locked_age <= (prev_high + 0.5 + self.interval_hysteresis_margin):
-                    iv_name, iv_idx, iv_low, iv_high = prev_name, prev_idx, prev_low, prev_high
+                init_std = self._initial_stds.get(track_id, 1.0)
 
+                if self.lock_on_first_shot and init_std <= 5.0:
+                    # Keep the first-shot locked interval and gender rock-solid
+                    iv_name, iv_idx, iv_low, iv_high = prev_name, prev_idx, prev_low, prev_high
+                    gender_label = self.locked_genders.get(track_id, gender_label)
+                    locked_age = float(np.clip(locked_age, float(iv_low), float(iv_high)))
+                    self.age_filters[track_id].age = locked_age
+                elif prev_idx != iv_idx:
+                    in_deadband = (
+                        (prev_low - 0.5 - self.interval_hysteresis_margin)
+                        <= locked_age
+                        <= (prev_high + 0.5 + self.interval_hysteresis_margin)
+                    )
+                    if in_deadband:
+                        iv_name, iv_idx, iv_low, iv_high = prev_name, prev_idx, prev_low, prev_high
+                        self._candidate_counts.pop(track_id, None)
+                    else:
+                        cand_idx, cand_cnt = self._candidate_counts.get(track_id, (iv_idx, 0))
+                        cand_cnt = (cand_cnt + 1) if (cand_idx == iv_idx and valid_measurement) else 1
+                        self._candidate_counts[track_id] = (iv_idx, cand_cnt)
+                        if cand_cnt < 5:
+                            iv_name, iv_idx, iv_low, iv_high = prev_name, prev_idx, prev_low, prev_high
+                        else:
+                            self.locked_intervals[track_id] = iv_idx
+                            self._initial_stds[track_id] = min(init_std, safe_std)
+                            self._candidate_counts.pop(track_id, None)
+
+        gender_prob = self.gender_accumulators[track_id].probability
         self.locked_intervals[track_id] = iv_idx
+        self.locked_genders[track_id] = gender_label
 
         return {
             "locked_age": locked_age,
@@ -269,5 +301,9 @@ class TargetLocker:
             self.age_filters.pop(tid, None)
             self.gender_accumulators.pop(tid, None)
             self.locked_intervals.pop(tid, None)
+            self.locked_genders.pop(tid, None)
+            self._initial_stds.pop(tid, None)
+            self._candidate_counts.pop(tid, None)
             self._measured_tracks.discard(tid)
+
 

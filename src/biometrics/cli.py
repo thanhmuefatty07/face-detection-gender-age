@@ -114,7 +114,7 @@ def main():
                     color = (0, 255, 0) if (audit is None or audit.passed) else (0, 0, 255)
                     cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
                     if pred:
-                        label = f"{pred.gender}, {pred.age_interval_name}y ({pred.expected_age:.0f}y)"
+                        label = f"{pred.gender} | {pred.age_interval_name}"
                         cv2.putText(frame, label, (x, max(20, y - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
                 cv2.imshow("SOTA Biometrics (Decoupled Dual-Engine)", frame)

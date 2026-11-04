@@ -1,24 +1,32 @@
 """
-Extreme Quality Auditor
-=======================
-Enforces highest biometric acceptance gates:
-- Laplacian variance >= 100.0 (micro-texture sharpness)
-- Tenengrad Sobel energy >= 250.0 (high-frequency edge gradient)
-- CIE L*a*b* Photometric Gate: Mean L in [35.0, 220.0]
-- Sensor Clipping: Shadow (L < 8) + Highlight (L > 240) <= 8.0%
-- Bilateral Cheek Delta E <= 18.0 (occlusion & non-uniform lighting detection)
-- Anthropometric solvePnP Head Pose: |Yaw| <= 35.0°, |Pitch| <= 25.0°, |Roll| <= 20.0°
-  with IEEE 754 float epsilon protection (eps = 1e-4).
+Biometric Face Quality Auditor & Perceptual Hash Utilities
+==========================================================
+Self-contained optical, geometric, and photometric face quality auditing
+and 64-bit DCT perceptual hashing for the biometric inference pipeline.
 """
 
 from __future__ import annotations
 import math
-from typing import Dict, Any, List, Optional, Tuple
+from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 
-from ...biometrics.core.geometry import estimate_head_pose_pnp
-from ...biometrics.core.types import FaceAuditResult
+from .geometry import estimate_head_pose_pnp
+from .types import FaceAuditResult
+
+
+def compute_64bit_dct_phash(image_gray: np.ndarray) -> int:
+    """
+    Computes 64-bit Discrete Cosine Transform (DCT) Perceptual Hash.
+    Invariant to uniform photometric scaling.
+    """
+    resized = cv2.resize(image_gray, (32, 32), interpolation=cv2.INTER_AREA)
+    dct = cv2.dct(np.float32(resized))[0:8, 0:8]
+    med = np.median(dct[1:, 1:])  # Ignore DC component
+    hash_val = 0
+    for b in (dct > med).flatten():
+        hash_val = (hash_val << 1) | int(b)
+    return hash_val
 
 
 class ExtremeQualityAuditor:
@@ -59,7 +67,7 @@ class ExtremeQualityAuditor:
         face_bgr: np.ndarray,
         landmarks_5: Optional[np.ndarray] = None,
         raw_width: Optional[int] = None,
-        raw_height: Optional[int] = None
+        raw_height: Optional[int] = None,
     ) -> FaceAuditResult:
         """
         Audits a face crop against all extreme criteria, including non-real/synthetic
@@ -101,7 +109,6 @@ class ExtremeQualityAuditor:
         elif mean_l > self.max_mean_luminance or mean_l_r > self.max_mean_luminance:
             rejection_reasons.append(f"OVEREXPOSED_LUMINANCE ({mean_l:.1f} > {self.max_mean_luminance})")
 
-        # Shadows L < 8 (prevent black hair false rejections) & Highlights L > 240
         shadow_clip = float(np.mean(l_channel < 8))
         highlight_clip = float(np.mean(l_channel > 240))
         shadow_clip_r = round(shadow_clip, 4)
@@ -114,19 +121,23 @@ class ExtremeQualityAuditor:
             or shadow_clip_r > self.max_clip_fraction
             or highlight_clip_r > self.max_clip_fraction
         ):
-            rejection_reasons.append(f"SENSOR_CLIPPING_EXCEEDED ({max(total_clip, total_clip_r)*100:.2f}% > {self.max_clip_fraction*100}%)")
+            rejection_reasons.append(
+                f"SENSOR_CLIPPING_EXCEEDED ({max(total_clip, total_clip_r)*100:.2f}% > {self.max_clip_fraction*100}%)"
+            )
 
         # 4. Bilateral Cheek Occlusion
         cheek_delta_e = 0.0
         if len(face_bgr.shape) == 3:
-            l_cheek = lab[int(0.55*h):int(0.75*h), int(0.15*w):int(0.35*w)]
-            r_cheek = lab[int(0.55*h):int(0.75*h), int(0.65*w):int(0.85*w)]
+            l_cheek = lab[int(0.55 * h) : int(0.75 * h), int(0.15 * w) : int(0.35 * w)]
+            r_cheek = lab[int(0.55 * h) : int(0.75 * h), int(0.65 * w) : int(0.85 * w)]
             if l_cheek.size > 0 and r_cheek.size > 0:
                 l_mean = np.mean(l_cheek, axis=(0, 1)).astype(np.float64)
                 r_mean = np.mean(r_cheek, axis=(0, 1)).astype(np.float64)
                 cheek_delta_e = float(np.linalg.norm(l_mean - r_mean))
                 if cheek_delta_e > self.max_cheek_delta_e or round(cheek_delta_e, 2) > self.max_cheek_delta_e:
-                    rejection_reasons.append(f"BILATERAL_CHEEK_ASYMMETRY_OCCLUSION (ΔE={cheek_delta_e:.1f} > {self.max_cheek_delta_e})")
+                    rejection_reasons.append(
+                        f"BILATERAL_CHEEK_ASYMMETRY_OCCLUSION (ΔE={cheek_delta_e:.1f} > {self.max_cheek_delta_e})"
+                    )
 
         # 5. Anthropometric Head Pose solvePnP
         yaw, pitch, roll = 0.0, 0.0, 0.0
@@ -150,7 +161,9 @@ class ExtremeQualityAuditor:
         top8_conc = self.compute_top_bin_concentration(gray, top_k=8)
         cheek_micro_std = self.compute_cheek_microtexture_std(gray)
         if len(face_bgr.shape) == 3:
-            chroma_std = float(np.hypot(np.std(lab[:, :, 1].astype(np.float32)), np.std(lab[:, :, 2].astype(np.float32))))
+            chroma_std = float(
+                np.hypot(np.std(lab[:, :, 1].astype(np.float32)), np.std(lab[:, :, 2].astype(np.float32)))
+            )
         else:
             chroma_std = 0.0
 
@@ -204,13 +217,6 @@ class ExtremeQualityAuditor:
 
     @staticmethod
     def compute_skin_tone_ita(lab_img: np.ndarray) -> Tuple[float, str]:
-        """
-        Computes Chardon et al. (1991) dermatological Individual Typology Angle (ITA°)
-        in CIE L*a*b* space on bilateral cheek ROIs with physiological melanin chrominance
-        regularization for achromatic/grayscale or cool-cast images:
-            ITA° = arctan((L*_CIE - 50) / b*_eff) * (180 / pi)
-        and maps ITA° to the 6 Fitzpatrick/Chardon skin-tone categories.
-        """
         if lab_img is None or lab_img.size == 0 or lab_img.ndim != 3:
             return 28.0, "Type_III_Intermediate"
         h, w = lab_img.shape[:2]
@@ -251,10 +257,6 @@ class ExtremeQualityAuditor:
 
     @staticmethod
     def compute_shannon_luminance_entropy(gray_img: np.ndarray) -> float:
-        """
-        Computes 8-bit Shannon luminance entropy H(I) = -sum p(k) log2 p(k) in [0, 8] bits.
-        Measures tonal information content and dynamic range utilization.
-        """
         if gray_img is None or gray_img.size == 0:
             return 0.0
         hist = cv2.calcHist([gray_img], [0], None, [256], [0, 256]).ravel()
@@ -264,9 +266,6 @@ class ExtremeQualityAuditor:
 
     @staticmethod
     def compute_michelson_contrast(gray_img: np.ndarray) -> float:
-        """
-        Computes robust percentile Michelson contrast (P95 - P5) / (P95 + P5 + eps).
-        """
         if gray_img is None or gray_img.size == 0:
             return 0.0
         p5, p95 = np.percentile(gray_img.astype(np.float32), [5.0, 95.0])
@@ -279,12 +278,6 @@ class ExtremeQualityAuditor:
     def compute_flat_gradient_ratio(
         gx: np.ndarray, gy: np.ndarray, gray_img: Optional[np.ndarray] = None
     ) -> float:
-        """
-        Computes fraction of interior facial pixels with near-zero Sobel gradient (|Gx| + |Gy| <= 1.0).
-        Real optical photographs have continuous sensor shot noise and skin pore micro-texture,
-        whereas vector cartoons, silhouettes, and flat-shaded CGI (including grain-injected flat renders)
-        have large zero-gradient regions on the raw or 5x5 denoised image.
-        """
         if gx is None or gy is None or gx.size == 0:
             return 1.0
         h, w = gx.shape[:2]
@@ -308,26 +301,15 @@ class ExtremeQualityAuditor:
 
     @staticmethod
     def compute_top_bin_concentration(gray_img: np.ndarray, top_k: int = 8) -> float:
-        """
-        Computes fraction of pixels concentrated in the top-k most frequent 8-bit luminance bins.
-        Rejects binary sketches, line drawings, and heavily posterized/color-quantized avatars.
-        """
         if gray_img is None or gray_img.size == 0:
             return 1.0
         hist = cv2.calcHist([gray_img], [0], None, [256], [0, 256]).ravel()
         p = hist / max(float(gray_img.size), 1.0)
-        top_probs = np.partition(p, -min(top_k, len(p)))[-min(top_k, len(p)):]
+        top_probs = np.partition(p, -min(top_k, len(p)))[-min(top_k, len(p)) :]
         return float(np.sum(top_probs))
 
     @staticmethod
     def compute_cheek_microtexture_std(gray_img: np.ndarray) -> float:
-        """
-        Computes high-frequency skin micro-texture standard deviation on bilateral cheek ROIs
-        via 3x3 Gaussian high-pass residual: std(I - G_3x3 * I).
-        Real optical human skin photographs exhibit continuous sensor shot noise and biological
-        pore micro-texture on the cheeks, whereas CGI/3D-rendered/Diffusion/airbrushed faces
-        with sharp drawn eyes/hair exhibit poreless plastic cheek surfaces.
-        """
         if gray_img is None or gray_img.size == 0:
             return 0.0
         gray_f = gray_img.astype(np.float32)

@@ -372,3 +372,121 @@ def test_hardware_resource_manager_and_end_to_end_pipeline():
         assert pred.gender in ("Male", "Female")
         assert abs(float(np.sum(pred.age_ldl_distribution)) - 1.0) < 1e-3
         assert abs(float(np.sum(pred.age_interval_probs)) - 1.0) < 1e-3
+
+
+def test_first_shot_target_lock_and_zero_post_lock_jumping():
+    """
+    Verifies 'một phát ăn ngay' (immediate 1st-shot target lock) and zero post-lock
+    interval/gender/frame jumping across 20 consecutive frames.
+    """
+    locker = TargetLocker(lock_on_first_shot=True)
+
+    # Frame 1: target acquired at 21.4y (just inside 18-21 / 22-25 boundary at 21.5), Female
+    f1 = locker.update(track_id=1, age_pred=21.4, aleatoric_std=1.8, gender_logit=2.4, has_measurement=True)
+    assert f1["locked_age_interval"] == "18-21"
+    assert f1["locked_gender"] == "Female"
+
+    # Subsequent frames with boundary jitter (21.8, 22.7, 21.2, 23.0, coasting, etc.) must NEVER jump interval or gender
+    for noisy_age, noisy_g in [(21.8, 1.9), (22.7, 0.8), (21.2, 2.1), (23.0, 1.2)]:
+        fn = locker.update(track_id=1, age_pred=noisy_age, aleatoric_std=2.0, gender_logit=noisy_g, has_measurement=True)
+        assert fn["locked_age_interval"] == "18-21"
+        assert fn["locked_gender"] == "Female"
+
+    # Coasting frames must also preserve locked interval and gender without decaying toward 0
+    for _ in range(15):
+        fc = locker.coast(track_id=1)
+        assert fc["locked_age_interval"] == "18-21"
+        assert fc["locked_gender"] == "Female"
+
+    # Verify live stream / multi-frame EdgeAsyncPipeline & CloudInferenceClient run inference ONLY on Frame 1
+    # for already-locked targets, preventing post-lock frame latency spikes and label jumping.
+    STrack.reset_counter()
+    client = CloudInferenceClient(enable_local_fallback=True, target_size=224, device="auto")
+    syn = SyntheticMultiTargetStream(width=640, height=480, num_targets=3)
+
+    infer_calls = 0
+    orig_infer = client.infer_locally
+
+    def counted_infer(dets):
+        nonlocal infer_calls
+        infer_calls += 1
+        return orig_infer(dets)
+
+    with patch.object(client, "infer_locally", side_effect=counted_infer):
+        first_locks = {}
+        for f_idx in range(12):
+            _, frm = syn.read()
+            dets = client.detect_faces(frm)
+            assert len(dets) == 3
+            targets = client.update_local_tracks(dets, cloud_results=None)
+            assert len(targets) == 3
+            for t in targets:
+                tid = t["track_id"]
+                if tid not in first_locks:
+                    first_locks[tid] = (t["locked_gender"], t["locked_age_interval"])
+                else:
+                    assert (t["locked_gender"], t["locked_age_interval"]) == first_locks[tid], (
+                        f"Post-lock jump on frame {f_idx} for track {tid}: "
+                        f"{(t['locked_gender'], t['locked_age_interval'])} != {first_locks[tid]}"
+                    )
+        # Inference should have executed ONLY once on Frame 1 when the 3 targets first appeared!
+        assert infer_calls == 1, f"Expected 1 first-shot inference call, got {infer_calls}"
+
+
+def test_clean_hud_displays_only_gender_and_age_range():
+    """
+    Verifies HUD renders ONLY Gender and Age Range on locked target boxes and hides
+    cluttered telemetry banner by default.
+    """
+    client = CloudInferenceClient(enable_local_fallback=False)
+    frame = np.full((480, 640, 3), 50, dtype=np.uint8)
+    targets = [
+        {
+            "track_id": 7,
+            "bbox": (120.0, 140.0, 260.0, 280.0),
+            "score": 0.96,
+            "locked_age": 20.4,
+            "locked_age_interval": "18-21",
+            "locked_age_interval_idx": 6,
+            "locked_gender": "Female",
+            "gender_prob": 0.94,
+            "aleatoric_std": 1.7,
+        }
+    ]
+    hud = client.render_hud(frame, targets, fps=60.0, latency_ms=12.3)
+    # Top-left telemetry region (10:34, 10:320) must be unchanged when show_telemetry=False (default)
+    assert np.array_equal(hud[10:34, 10:320], frame[10:34, 10:320])
+    # Target box region must have been drawn
+    assert not np.array_equal(hud[110:285, 115:265], frame[110:285, 115:265])
+
+
+def test_macos_darwin_support_and_one_click_launchers():
+    """
+    Verifies macOS (darwin) CPU/memory/MPS/AVFoundation camera support, LF line endings
+    on run.command & run.sh, and zero dependency on src/mining.
+    """
+    run_cmd = ROOT_DIR / "run.command"
+    run_sh = ROOT_DIR / "run.sh"
+    run_bat = ROOT_DIR / "run.bat"
+    assert run_cmd.exists() and run_sh.exists() and run_bat.exists()
+    assert b"\r\n" not in run_cmd.read_bytes(), "run.command must use LF line endings for macOS"
+    assert b"\r\n" not in run_sh.read_bytes(), "run.sh must use LF line endings for macOS/Linux"
+
+    with patch("sys.platform", "darwin"):
+        backends = CameraPortScanner.get_platform_backends()
+        assert backends[0][0] == "AVFOUNDATION"
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 0
+            mock_run.return_value.stdout = (
+                "Camera:\n\n    FaceTime HD Camera:\n\n      Model ID: FaceTime\n\n    ngohuy Camera:\n\n      Model ID: iPhone15,3\n"
+            )
+            cam_names = CameraPortScanner.enumerate_os_camera_names()
+            assert "FaceTime HD Camera" in cam_names
+            assert "ngohuy Camera" in cam_names
+
+    # Ensure no file in src/biometrics imports from src.mining or ..mining
+    for py_file in (ROOT_DIR / "src" / "biometrics").rglob("*.py"):
+        content = py_file.read_text(encoding="utf-8")
+        assert "mining" not in content, f"{py_file} still references mining!"
+

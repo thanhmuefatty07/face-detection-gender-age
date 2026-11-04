@@ -681,7 +681,24 @@ class BiometricMultiTaskModel(nn.Module):
         age_probs = age_probs / torch.clamp(age_probs.sum(dim=-1, keepdim=True), min=1e-12)
         age_logits = torch.log(torch.clamp(age_probs, min=1e-8))
         age_bins_cast = self.age_bins_vec.to(dtype=age_probs.dtype)
-        expected_age = torch.sum(age_probs * age_bins_cast, dim=-1)
+        raw_exp = torch.sum(age_probs * age_bins_cast, dim=-1, keepdim=True)
+        if age_probs.shape[-1] >= 5:
+            pad_p = F.pad(age_probs.unsqueeze(1), (2, 2), mode="replicate").squeeze(1)
+            smooth_p = (
+                0.10 * pad_p[:, :-4]
+                + 0.20 * pad_p[:, 1:-3]
+                + 0.40 * pad_p[:, 2:-2]
+                + 0.20 * pad_p[:, 3:-1]
+                + 0.10 * pad_p[:, 4:]
+            )
+            peak_bins = torch.argmax(smooth_p, dim=-1, keepdim=True).to(dtype=age_probs.dtype)
+            center = 0.55 * peak_bins + 0.45 * raw_exp
+            win = torch.exp(-0.5 * ((age_bins_cast.unsqueeze(0) - center) / 8.5) ** 2)
+            p_focus = (age_probs ** 1.25) * (0.10 + 0.90 * win)
+            p_focus = p_focus / torch.clamp(p_focus.sum(dim=-1, keepdim=True), min=1e-12)
+            expected_age = torch.sum(p_focus * age_bins_cast, dim=-1)
+        else:
+            expected_age = raw_exp.squeeze(-1)
 
         fine_iv_logits = 0.5 * (out_cat["age_interval_logits"][:B] + out_cat["age_interval_logits"][B:])
         part_mat_probs = self.fine_interval_partition.to(dtype=age_probs.dtype)
