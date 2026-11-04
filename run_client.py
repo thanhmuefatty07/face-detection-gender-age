@@ -121,7 +121,7 @@ def main():
         print_camera_scan_report()
         return
 
-    if args.camera.strip().lower() in ("demo", "synthetic"):
+    if args.demo or args.camera.strip().lower() in ("demo", "synthetic"):
         args.demo = True
         cam_source = "demo"
     elif args.camera.strip().lower() in ("auto", "scan", "default", ""):

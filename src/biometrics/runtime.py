@@ -833,7 +833,6 @@ class CameraPortScanner:
         if sys.platform == "darwin":
             return [
                 ("AVFOUNDATION", getattr(cv2, "CAP_AVFOUNDATION", 1200)),
-                ("ANY", getattr(cv2, "CAP_ANY", 0)),
             ]
         return [("ANY", getattr(cv2, "CAP_ANY", 0))]
 
@@ -1091,7 +1090,11 @@ class CameraPortScanner:
         discovered: List[CameraPortInfo] = []
         consecutive_dead = 0
 
-        for idx in range(max(1, int(max_index))):
+        scan_limit = max(1, int(max_index))
+        if sys.platform == "darwin" and os_names:
+            scan_limit = min(scan_limit, max(1, len(os_names)))
+
+        for idx in range(scan_limit):
             if active_port_info is not None and active_port_info.port == idx and active_port_info.can_read:
                 discovered.append(active_port_info)
                 consecutive_dead = 0
@@ -1103,6 +1106,8 @@ class CameraPortScanner:
                 consecutive_dead = 0
             else:
                 consecutive_dead += 1
+                if sys.platform == "darwin" and idx == 0:
+                    break
                 if idx >= 2 and consecutive_dead >= 3 and len(os_names) <= idx:
                     break
 
