@@ -1,9 +1,12 @@
 """
-Edge Asynchronous Inference Pipeline (OpenVINO / Local Standalone)
-==================================================================
-Runs completely offline on local CPU / iGPU without cloud network dependency.
-Supports OpenVINO runtime acceleration (GPU/CPU) and PyTorch AVX2 fallback.
-Pipelined multi-stage execution with accurate multi-target biometric tracking.
+Edge Asynchronous Inference Pipeline (OpenVINO / CUDA / Local Standalone)
+=========================================================================
+Runs completely offline on local CPU / iGPU / dGPU without cloud network dependency.
+Integrates:
+1. HardwareResourceManager (CPU thread/affinity/priority tuning, OpenVINO disk caching, CUDA AMP)
+2. EnvironmentNormalizer (multi-environment low-light, backlight, glare, color-cast & blur compensation)
+3. Multi-Scale YuNet Face Detection + 5-Point Umeyama Similarity Alignment
+4. Multi-Target ByteTrack (with Tier-1 Re-ID anti-swap gating) + Epistemic TargetLocker
 """
 
 from __future__ import annotations
@@ -18,6 +21,7 @@ from src.biometrics.estimation.backbone import BiometricMultiTaskModel
 from src.biometrics.tracking.byte_tracker import ByteTracker, Detection
 from src.biometrics.tracking.target_locker import TargetLocker
 from src.biometrics.detection.yunet_detector import YuNetFaceDetector
+from src.biometrics.runtime import HardwareResourceManager, EnvironmentNormalizer
 
 try:
     import openvino as ov
@@ -28,26 +32,39 @@ except ImportError:
 class EdgeAsyncPipeline:
     """
     Local edge standalone biometric estimation and multi-target locking pipeline.
-    Seamlessly integrates OpenVINO iGPU/CPU acceleration, YuNet detection,
-    5-point Umeyama affine alignment, and Epistemic Target Locking.
+    Seamlessly integrates OpenVINO/CUDA/CPU acceleration, multi-environment normalization,
+    YuNet multi-scale detection, 5-point Umeyama affine alignment, and Epistemic Target Locking.
     """
 
     def __init__(
         self,
         backbone_name: str = "convnextv2_tiny",
-        max_targets: int = 5,
+        max_targets: int = 16,
         use_openvino: bool = False,
         device: str = "cpu",
         yunet_model_path: Optional[str | Path] = None,
         enable_flip_tta: bool = True,
         checkpoint_path: Optional[str | Path] = None,
         target_size: Optional[int] = None,
+        enable_env_normalization: bool = True,
+        max_batch_size: int = 16,
     ):
+        self.hw_profile = HardwareResourceManager.optimize_process_resources()
+        self.hw_config = HardwareResourceManager.resolve_device_and_backend(
+            requested_device=device,
+            use_openvino=use_openvino,
+        )
+
         self.backbone_name = backbone_name
-        self.max_targets = max_targets
-        self.device = device
-        self.use_openvino = use_openvino
-        self.enable_flip_tta = enable_flip_tta
+        self.max_targets = int(max_targets)
+        self.torch_device = self.hw_config["torch_device"]
+        self.device = self.torch_device
+        self.ov_target_device = self.hw_config["ov_device"]
+        self.use_openvino = bool(use_openvino)
+        self.enable_flip_tta = bool(enable_flip_tta)
+        self.enable_env_normalization = bool(enable_env_normalization)
+        self.max_batch_size = max(1, int(max_batch_size))
+
         if target_size is None:
             self.target_size = 224 if backbone_name == "convnextv2_tiny" else 160
         else:
@@ -55,27 +72,31 @@ class EdgeAsyncPipeline:
 
         # 1. Initialize local PyTorch model
         self.model = BiometricMultiTaskModel(backbone_name=backbone_name, pretrained=False)
+        self._loaded_checkpoint_path: Optional[Path] = None
         if checkpoint_path is None and backbone_name == "convnextv2_tiny":
             default_ckpt = Path(__file__).resolve().parent.parent.parent.parent / "models" / "convnextv2_tiny_biometrics.pt"
             if default_ckpt.exists():
                 checkpoint_path = default_ckpt
         if checkpoint_path is not None and Path(checkpoint_path).exists():
-            ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+            ckpt_p = Path(checkpoint_path)
+            ckpt = torch.load(ckpt_p, map_location=self.torch_device, weights_only=False)
             state_dict = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
             try:
                 self.model.load_state_dict(state_dict, strict=True)
             except RuntimeError:
                 self.model.load_state_dict(state_dict, strict=False)
-        self.model.to(self.device)
+            self._loaded_checkpoint_path = ckpt_p
+
+        self.model.to(self.torch_device)
         self.model.eval()
 
         # 2. OpenVINO runtime acceleration
         self.ov_compiled_model = None
         self.ov_infer_request = None
         if self.use_openvino and ov is not None:
-            self._init_openvino(target_device=device)
+            self._init_openvino(target_device=self.ov_target_device)
 
-        # 3. YuNet Face Detector & 5-Point Umeyama Aligner
+        # 3. YuNet Face Detector, 5-Point Umeyama Aligner & Multi-Environment Normalizer
         if yunet_model_path is None:
             default_p = Path(__file__).resolve().parent.parent.parent.parent / "models" / "face_detection_yunet_2023mar.onnx"
             if default_p.exists():
@@ -85,27 +106,51 @@ class EdgeAsyncPipeline:
 
         self.detector = YuNetFaceDetector(model_path=yunet_model_path, confidence_threshold=0.5)
         self.aligner = UmeyamaAligner(target_size=self.target_size)
+        self.env_normalizer = EnvironmentNormalizer()
 
         # 4. Multi-target tracker and Epistemic Locker
-        self.tracker = ByteTracker(max_targets=max_targets)
+        self.tracker = ByteTracker(max_targets=self.max_targets)
         self.locker = TargetLocker()
 
-    def _init_openvino(self, target_device: str = "cpu"):
-        """Initializes and compiles OpenVINO execution engine on CPU or iGPU."""
+    def _init_openvino(self, target_device: str = "CPU"):
+        """Initializes and compiles OpenVINO execution engine with optimal CPU/GPU properties."""
         try:
             core = ov.Core()
-            available = core.available_devices
-            ov_dev = target_device.upper()
+            available = list(core.available_devices)
+            ov_dev = str(target_device).upper()
             if ov_dev not in available:
-                ov_dev = "GPU" if "GPU" in available else "CPU"
+                ov_dev = "CPU" if "CPU" in available else (available[0] if available else "CPU")
 
-            dummy = torch.zeros(1, 3, self.target_size, self.target_size, device=self.device)
+            # Enable persistent disk cache only when loading a deterministic checkpoint file
+            if self._loaded_checkpoint_path is not None:
+                cache_dir = self._loaded_checkpoint_path.parent / ".ov_cache"
+                try:
+                    cache_dir.mkdir(parents=True, exist_ok=True)
+                    core.set_property({"CACHE_DIR": str(cache_dir)})
+                except Exception:
+                    pass
+
+            dummy = torch.zeros(1, 3, self.target_size, self.target_size, device=self.torch_device)
             ov_model = ov.convert_model(self.model, example_input=dummy)
-            # Make batch dimension dynamic
-            ov_model.inputs[0].get_node().set_partial_shape(ov.PartialShape([-1, 3, self.target_size, self.target_size]))
+            if ov_dev == "CPU":
+                ov_model.inputs[0].get_node().set_partial_shape(
+                    ov.PartialShape([-1, 3, self.target_size, self.target_size])
+                )
+            else:
+                ov_model.inputs[0].get_node().set_partial_shape(
+                    ov.PartialShape([ov.Dimension(1, 8), 3, self.target_size, self.target_size])
+                )
             ov_model.validate_nodes_and_infer_types()
 
-            compiled = core.compile_model(ov_model, ov_dev)
+            compile_props: Dict[str, Any] = {"PERFORMANCE_HINT": "LATENCY"}
+            if ov_dev == "CPU":
+                compile_props["INFERENCE_NUM_THREADS"] = self.hw_profile.get("logical_cores", 4)
+
+            try:
+                compiled = core.compile_model(ov_model, ov_dev, compile_props)
+            except Exception:
+                compiled = core.compile_model(ov_model, ov_dev)
+
             self.ov_compiled_model = compiled
             self.ov_infer_request = compiled.create_infer_request()
         except Exception:
@@ -114,7 +159,7 @@ class EdgeAsyncPipeline:
 
     def detect_faces(self, frame: np.ndarray) -> List[Dict[str, Any]]:
         """
-        Detects faces in frame using YuNet with fallback.
+        Detects faces in frame using multi-scale, multi-environment YuNet.
         Returns list of {'bbox': (x1, y1, x2, y2), 'score': float, 'landmarks': Optional[np.ndarray]}.
         """
         if frame is None or frame.size == 0 or frame.ndim != 3:
@@ -138,18 +183,22 @@ class EdgeAsyncPipeline:
             })
         return results
 
-    def _infer_crops(self, crops: List[np.ndarray]) -> Tuple[List[float], List[float], List[float], List[Optional[np.ndarray]]]:
-        """Runs forward inference on 160x160 face crops via OpenVINO or PyTorch."""
+    def _infer_single_batch(
+        self,
+        crops: List[np.ndarray],
+        enable_flip_tta: Optional[bool] = None,
+    ) -> Tuple[List[float], List[float], List[float], List[Optional[np.ndarray]]]:
         N = len(crops)
         if N == 0:
             return [], [], [], []
 
+        use_tta = self.enable_flip_tta if enable_flip_tta is None else bool(enable_flip_tta)
         batch_arr = np.stack(crops, axis=0).transpose(0, 3, 1, 2)
         batch_float = np.ascontiguousarray(batch_arr.astype(np.float32) / 127.5 - 1.0)
 
         if self.ov_compiled_model is not None:
             try:
-                if self.enable_flip_tta:
+                if use_tta:
                     batch_flip = np.ascontiguousarray(batch_float[:, :, :, ::-1])
                     inp_ov = np.concatenate([batch_float, batch_flip], axis=0)
                     ov_out = self.ov_compiled_model(inp_ov)
@@ -212,11 +261,11 @@ class EdgeAsyncPipeline:
             except Exception:
                 pass
 
-        # PyTorch execution (with Flip-TTA via predict_smooth when available)
-        tensor = torch.from_numpy(batch_float).to(self.device)
-        with torch.no_grad():
+        # PyTorch execution with torch.inference_mode()
+        tensor = torch.from_numpy(batch_float).to(self.torch_device)
+        with torch.inference_mode():
             if hasattr(self.model, "predict_smooth"):
-                out = self.model.predict_smooth(tensor, enable_flip_tta=self.enable_flip_tta)
+                out = self.model.predict_smooth(tensor, enable_flip_tta=use_tta)
             else:
                 out = self.model(tensor)
 
@@ -242,10 +291,35 @@ class EdgeAsyncPipeline:
 
         return age_preds, std_preds, g_logits, reid_embs
 
+    def _infer_crops(
+        self,
+        crops: List[np.ndarray],
+    ) -> Tuple[List[float], List[float], List[float], List[Optional[np.ndarray]]]:
+        """Runs forward inference on face crops via OpenVINO or PyTorch with bounded sub-batching."""
+        N = len(crops)
+        if N == 0:
+            return [], [], [], []
+
+        if N <= self.max_batch_size:
+            return self._infer_single_batch(crops, enable_flip_tta=self.enable_flip_tta)
+
+        all_ages: List[float] = []
+        all_stds: List[float] = []
+        all_g_logits: List[float] = []
+        all_reids: List[Optional[np.ndarray]] = []
+        for start in range(0, N, self.max_batch_size):
+            chunk = crops[start : start + self.max_batch_size]
+            ages, stds, g_logits, reids = self._infer_single_batch(chunk, enable_flip_tta=self.enable_flip_tta)
+            all_ages.extend(ages)
+            all_stds.extend(stds)
+            all_g_logits.extend(g_logits)
+            all_reids.extend(reids)
+        return all_ages, all_stds, all_g_logits, all_reids
+
     def process_frame(self, frame: np.ndarray) -> List[Dict[str, Any]]:
         """
-        Processes a single video frame locally.
-        Guarantees correct biometric alignment across multiple targets.
+        Processes a single video frame locally across multiple targets and lighting environments.
+        Guarantees strict 1-to-1 biometric alignment without cross-track contamination.
         
         Args:
             frame: (H, W, 3) BGR image
@@ -259,8 +333,10 @@ class EdgeAsyncPipeline:
 
         crops: List[np.ndarray] = []
         valid_det_indices: List[int] = []
+        env_unc_multipliers: List[float] = []
 
         for i, d in enumerate(raw_dets):
+            crop_rgb = None
             lmks = d.get("landmarks")
             if lmks is not None:
                 try:
@@ -268,24 +344,29 @@ class EdgeAsyncPipeline:
                     if lmks_arr.shape == (5, 2) and np.all(np.isfinite(lmks_arr)):
                         aligned_bgr = self.aligner.align(frame, lmks_arr)
                         crop_rgb = cv2.cvtColor(aligned_bgr, cv2.COLOR_BGR2RGB)
-                        crops.append(crop_rgb)
-                        valid_det_indices.append(i)
-                        continue
                 except Exception:
-                    pass
+                    crop_rgb = None
 
-            x1, y1, x2, y2 = [int(v) for v in d["bbox"]]
-            x1 = max(0, x1)
-            y1 = max(0, y1)
-            x2 = min(W, x2)
-            y2 = min(H, y2)
-            if x2 > x1 and y2 > y1:
-                crop = frame[y1:y2, x1:x2]
-                if crop.size > 0:
-                    crop_resized = cv2.resize(crop, (self.target_size, self.target_size))
-                    crop_rgb = cv2.cvtColor(crop_resized, cv2.COLOR_BGR2RGB)
-                    crops.append(crop_rgb)
-                    valid_det_indices.append(i)
+            if crop_rgb is None:
+                x1, y1, x2, y2 = [int(v) for v in d["bbox"]]
+                x1 = max(0, x1)
+                y1 = max(0, y1)
+                x2 = min(W, x2)
+                y2 = min(H, y2)
+                if x2 > x1 and y2 > y1:
+                    crop = frame[y1:y2, x1:x2]
+                    if crop.size > 0:
+                        crop_resized = cv2.resize(crop, (self.target_size, self.target_size))
+                        crop_rgb = cv2.cvtColor(crop_resized, cv2.COLOR_BGR2RGB)
+
+            if crop_rgb is not None:
+                if self.enable_env_normalization:
+                    crop_rgb, env_info = self.env_normalizer.normalize_crop_for_inference(crop_rgb, is_bgr=False)
+                    env_unc_multipliers.append(float(env_info.get("uncertainty_multiplier", 1.0)))
+                else:
+                    env_unc_multipliers.append(1.0)
+                crops.append(crop_rgb)
+                valid_det_indices.append(i)
 
         age_preds, std_preds, gender_logits, reid_feats = self._infer_crops(crops)
 
@@ -313,16 +394,21 @@ class EdgeAsyncPipeline:
         for lost_t in self.tracker.lost_tracks:
             self.locker.coast(lost_t.track_id)
 
+        used_crop_indices = set()
         output_targets: List[Dict[str, Any]] = []
         for t in online_tracks:
             matched_crop_idx = None
             if t.last_det_id is not None and t.last_det_id in crop_index_by_det:
                 matched_crop_idx = crop_index_by_det[t.last_det_id]
+                used_crop_indices.add(matched_crop_idx)
             else:
-                # Spatial IoU fallback for matched detection
+                # Strict 1-to-1 Spatial IoU fallback for matched detection
                 best_iou = 0.2
                 best_idx = None
                 for det_i in valid_det_indices:
+                    cand_c_idx = crop_index_by_det.get(det_i)
+                    if cand_c_idx is None or cand_c_idx in used_crop_indices:
+                        continue
                     d_box = raw_dets[det_i]["bbox"]
                     xx1 = max(t.bbox[0], d_box[0])
                     yy1 = max(t.bbox[1], d_box[1])
@@ -337,10 +423,12 @@ class EdgeAsyncPipeline:
                         best_idx = det_i
                 if best_idx is not None and best_idx in crop_index_by_det:
                     matched_crop_idx = crop_index_by_det[best_idx]
+                    used_crop_indices.add(matched_crop_idx)
 
             if matched_crop_idx is not None and matched_crop_idx < len(age_preds):
                 age_val = float(age_preds[matched_crop_idx])
-                std_val = float(std_preds[matched_crop_idx])
+                env_mult = env_unc_multipliers[matched_crop_idx] if matched_crop_idx < len(env_unc_multipliers) else 1.0
+                std_val = float(std_preds[matched_crop_idx]) * env_mult
                 g_logit = float(gender_logits[matched_crop_idx])
                 has_meas = True
             else:

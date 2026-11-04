@@ -1,10 +1,11 @@
 """
-Local Cloud Inference Client (iVCam -> WebSocket Tunnel -> HUD)
-===============================================================
-Captures video stream (iVCam / USB webcam / DirectShow),
-detects faces locally using YuNet C++, sends compressed 160x160 face crops
-over secure WebSocket to Kaggle GPU Server, receives SOTA ConvNeXt-V2 predictions,
-updates ByteTrack & TargetLocker, and renders a 60 FPS real-time HUD.
+Unified Cloud & Local Hybrid Biometric Client (Camera -> Edge/Cloud -> HUD)
+===========================================================================
+Captures video stream with automatic multi-backend camera port discovery
+(iVCam / USB webcam / DirectShow / MSMF / V4L2), detects faces locally using
+multi-scale YuNet, queries Kaggle GPU Server over WebSocket OR falls back seamlessly
+to local ConvNeXt-V2 EdgeAsyncPipeline (OpenVINO/CUDA/CPU), updates ByteTrack &
+TargetLocker, and renders a real-time HUD.
 """
 
 from __future__ import annotations
@@ -20,33 +21,48 @@ from src.biometrics.core.geometry import UmeyamaAligner
 from src.biometrics.tracking.byte_tracker import ByteTracker, Detection, STrack
 from src.biometrics.tracking.target_locker import TargetLocker
 from src.biometrics.detection.yunet_detector import YuNetFaceDetector
+from src.biometrics.runtime import (
+    CameraPortScanner,
+    ThreadedCameraStream,
+    EnvironmentNormalizer,
+    HardwareResourceManager,
+    suppress_opencv_logs,
+)
 
 
 class CloudInferenceClient:
     """
-    Client managing local face detection, WebSocket cloud inference,
-    ByteTrack ID persistence, and Epistemic Target Locking.
+    Client managing local face detection, WebSocket cloud inference (with automatic
+    local ConvNeXt-V2 Edge fallback), ByteTrack ID persistence, and Epistemic Target Locking.
     """
 
     def __init__(
         self,
         server_url: str = "ws://localhost:8000/ws/infer",
-        max_targets: int = 5,
+        max_targets: int = 16,
         track_thresh: float = 0.6,
         low_thresh: float = 0.2,
         yunet_model_path: Optional[str | Path] = None,
         target_size: int = 160,
+        enable_local_fallback: bool = False,
+        device: str = "auto",
     ):
+        HardwareResourceManager.optimize_process_resources()
         self.server_url = server_url
-        self.max_targets = max_targets
+        self.max_targets = int(max_targets)
         self.target_size = int(target_size)
+        self.enable_local_fallback = bool(enable_local_fallback)
+        self.device = device
+
         self.tracker = ByteTracker(
             track_thresh=track_thresh,
             low_thresh=low_thresh,
-            max_targets=max_targets,
+            max_targets=self.max_targets,
         )
         self.locker = TargetLocker()
         self.aligner = UmeyamaAligner(target_size=self.target_size)
+        self.env_normalizer = EnvironmentNormalizer()
+        self._local_edge: Optional[Any] = None
 
         # Initialize YuNet Face Detector
         if yunet_model_path is None:
@@ -57,6 +73,50 @@ class CloudInferenceClient:
                 yunet_model_path = "models/face_detection_yunet_2023mar.onnx"
 
         self.detector = YuNetFaceDetector(model_path=yunet_model_path, confidence_threshold=0.5)
+
+    def _get_local_edge(self) -> Any:
+        if self._local_edge is None:
+            from src.biometrics.inference.async_pipeline import EdgeAsyncPipeline
+            hw_cfg = HardwareResourceManager.resolve_device_and_backend(self.device)
+            self._local_edge = EdgeAsyncPipeline(
+                backbone_name="convnextv2_tiny",
+                max_targets=self.max_targets,
+                use_openvino=hw_cfg["use_openvino"],
+                device=self.device,
+                target_size=self.target_size,
+            )
+        return self._local_edge
+
+    def infer_locally(self, local_dets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Runs local ConvNeXt-V2 inference on detected face crops when cloud is offline or disabled."""
+        if not local_dets:
+            return []
+        edge = self._get_local_edge()
+        crops_rgb: List[np.ndarray] = []
+        env_mults: List[float] = []
+        for ld in local_dets:
+            crop_bgr = ld.get("crop")
+            if crop_bgr is not None:
+                norm_bgr, env_info = self.env_normalizer.normalize_crop_for_inference(crop_bgr, is_bgr=True)
+                crops_rgb.append(cv2.cvtColor(norm_bgr, cv2.COLOR_BGR2RGB))
+                env_mults.append(float(env_info.get("uncertainty_multiplier", 1.0)))
+
+        if not crops_rgb:
+            return []
+
+        ages, stds, g_logits, reids = edge._infer_crops(crops_rgb)
+        results: List[Dict[str, Any]] = []
+        for i in range(len(ages)):
+            g_logit = float(g_logits[i])
+            g_prob = float(1.0 / (1.0 + np.exp(-np.clip(g_logit, -20.0, 20.0))))
+            results.append({
+                "expected_age": float(ages[i]),
+                "aleatoric_std": float(stds[i]) * (env_mults[i] if i < len(env_mults) else 1.0),
+                "gender_logit": g_logit,
+                "gender_prob": g_prob,
+                "reid_embedding": reids[i].tolist() if reids[i] is not None else None,
+            })
+        return results
 
     def detect_faces(self, frame: np.ndarray) -> List[Dict[str, Any]]:
         """
@@ -118,14 +178,8 @@ class CloudInferenceClient:
         cloud_results: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Associates cloud predictions with local detections and updates tracker & locker.
+        Associates cloud/local predictions with local detections and updates tracker & locker.
         Guarantees that occluded tracks coast stably without corrupting biometric filters.
-        
-        Args:
-            local_dets: list of detections with 'bbox': (x1, y1, x2, y2), 'score': float, 'crop': np.ndarray
-            cloud_results: corresponding list of cloud results with age/gender/reid
-        Returns:
-            List of active locked targets with smoothed age, locked gender, and HUD info
         """
         tracker_dets: List[Detection] = []
         for i, ld in enumerate(local_dets):
@@ -144,17 +198,21 @@ class CloudInferenceClient:
         for lost_t in self.tracker.lost_tracks:
             self.locker.coast(lost_t.track_id)
 
+        used_det_indices = set()
         output_targets: List[Dict[str, Any]] = []
         for t in online_tracks:
             matched_res = None
             if cloud_results and len(cloud_results) > 0:
                 if t.last_det_id is not None and t.last_det_id < len(cloud_results):
                     matched_res = cloud_results[t.last_det_id]
+                    used_det_indices.add(t.last_det_id)
                 else:
-                    # Spatial IoU fallback
+                    # Strict 1-to-1 Spatial IoU fallback
                     best_iou = 0.2
                     best_idx = None
                     for idx, ld in enumerate(local_dets):
+                        if idx in used_det_indices:
+                            continue
                         b = ld.get("bbox", (0.0, 0.0, 0.0, 0.0))
                         xx1 = max(t.bbox[0], b[0])
                         yy1 = max(t.bbox[1], b[1])
@@ -169,6 +227,7 @@ class CloudInferenceClient:
                             best_idx = idx
                     if best_idx is not None and best_idx < len(cloud_results):
                         matched_res = cloud_results[best_idx]
+                        used_det_indices.add(best_idx)
 
             if matched_res is not None:
                 age_pred = float(matched_res.get("expected_age", 25.0))
@@ -210,12 +269,6 @@ class CloudInferenceClient:
     ) -> Tuple[Optional[List[Dict[str, Any]]], float]:
         """
         Transmits encoded face crops to Kaggle cloud server and receives biometric predictions.
-        
-        Args:
-            local_dets: list of face detections containing 160x160 crops
-            ws_conn: active persistent WebSocket connection if available
-        Returns:
-            Tuple of (cloud_results, rtt_latency_ms)
         """
         if not local_dets:
             return [], 0.0
@@ -268,13 +321,15 @@ class CloudInferenceClient:
         fps: float = 0.0,
         latency_ms: float = 0.0,
         cloud_connected: bool = True,
+        mode_label: Optional[str] = None,
     ) -> np.ndarray:
         """Renders futuristic HUD overlay for locked biometric targets with telemetry banner."""
         hud_img = frame.copy()
 
-        # Top Telemetry Header
-        header_text = f"FPS: {fps:4.1f} | RTT: {latency_ms:4.1f}ms | Cloud: {'ONLINE' if cloud_connected else 'COASTING'}"
-        cv2.rectangle(hud_img, (10, 10), (320, 34), (20, 20, 20), -1)
+        status_str = mode_label or ("ONLINE" if cloud_connected else "COASTING")
+        header_text = f"FPS: {fps:4.1f} | Infer: {latency_ms:4.1f}ms | Targets: {len(targets)} | Mode: {status_str}"
+        (hw, _), _ = cv2.getTextSize(header_text, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+        cv2.rectangle(hud_img, (10, 10), (max(320, hw + 26), 34), (20, 20, 20), -1)
         stat_color = (0, 255, 120) if cloud_connected else (0, 180, 255)
         cv2.putText(hud_img, header_text, (16, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.45, stat_color, 1, cv2.LINE_AA)
 
@@ -285,19 +340,15 @@ class CloudInferenceClient:
             gender = tgt["locked_gender"]
             std = tgt.get("aleatoric_std", 1.0)
 
-            # Color theme: Female = Magenta/Coral (200, 50, 220), Male = Cyan (240, 180, 40)
             color = (200, 50, 220) if gender == "Female" else (240, 180, 40)
 
-            # Draw target bounding box with corner reticles
             cv2.rectangle(hud_img, (x1, y1), (x2, y2), color, 2)
             corner_len = min(15, max(5, (x2 - x1) // 4))
-            # Corners
             cv2.line(hud_img, (x1, y1), (x1 + corner_len, y1), color, 3)
             cv2.line(hud_img, (x1, y1), (x1, y1 + corner_len), color, 3)
             cv2.line(hud_img, (x2, y1), (x2 - corner_len, y1), color, 3)
             cv2.line(hud_img, (x2, y1), (x2, y1 + corner_len), color, 3)
 
-            # HUD Label banner
             from ..estimation.intervals import get_fine_interval_for_age
             age_iv = tgt.get("locked_age_interval") or get_fine_interval_for_age(age)[0]
             label = f"ID #{tid} | {gender} | {age_iv}y ({age:.1f}y +/-{std:.1f})"
@@ -316,61 +367,77 @@ class CloudInferenceClient:
 
         return hud_img
 
-    def open_camera(self, camera_source: Union[int, str] = 0) -> cv2.VideoCapture:
+    def open_camera(self, camera_source: Union[int, str] = "auto") -> cv2.VideoCapture:
         """
-        Opens camera capture stream, optimizing for iVCam DirectShow backend.
+        Opens camera capture stream with automatic multi-backend port discovery & failover.
         """
-        if isinstance(camera_source, int):
-            # Try DirectShow for low-latency iVCam on Windows
-            cap = cv2.VideoCapture(camera_source, cv2.CAP_DSHOW)
-            if not cap.isOpened():
-                cap = cv2.VideoCapture(camera_source)
-        else:
-            cap = cv2.VideoCapture(str(camera_source))
+        with suppress_opencv_logs():
+            if isinstance(camera_source, str) and camera_source.strip().lower() in ("auto", "scan", "default", ""):
+                best = CameraPortScanner.find_best_camera_port("auto")
+                if best.is_opened and isinstance(best.port, int):
+                    cap = cv2.VideoCapture(best.port, best.backend_id) if best.backend_id != 0 else cv2.VideoCapture(best.port)
+                else:
+                    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+                    if not cap.isOpened():
+                        cap = cv2.VideoCapture(0)
+            elif isinstance(camera_source, int):
+                cap = cv2.VideoCapture(camera_source, cv2.CAP_DSHOW)
+                if not cap.isOpened():
+                    cap = cv2.VideoCapture(camera_source, getattr(cv2, "CAP_MSMF", 1400))
+                if not cap.isOpened():
+                    cap = cv2.VideoCapture(camera_source)
+                if not cap.isOpened():
+                    best = CameraPortScanner.find_best_camera_port("auto")
+                    if best.is_opened and isinstance(best.port, int):
+                        cap = cv2.VideoCapture(best.port, best.backend_id) if best.backend_id != 0 else cv2.VideoCapture(best.port)
+            else:
+                cap = cv2.VideoCapture(str(camera_source))
 
-        if cap.isOpened():
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            cap.set(cv2.CAP_PROP_FPS, 60)
-        return cap
+            if cap is not None and cap.isOpened():
+                try:
+                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    cap.set(cv2.CAP_PROP_FPS, 60)
+                except Exception:
+                    pass
+            return cap
 
     def run_live_stream(
         self,
-        camera_source: Union[int, str] = 0,
+        camera_source: Union[int, str] = "auto",
         max_frames: Optional[int] = None,
         display: bool = False,
         use_cloud: bool = True,
+        allow_demo_fallback: bool = False,
+        infer_interval: int = 2,
     ) -> Generator[np.ndarray, None, None]:
         """
-        Live physical/synthetic video processing generator with cloud WebSocket tunnel.
-        
-        Args:
-            camera_source: Camera index (0 for iVCam / default USB) or video file path
-            max_frames: Optional frame limit
-            display: Whether to open cv2.imshow GUI window
-            use_cloud: Whether to transmit crops to Kaggle cloud server
-        Yields:
-            Processed HUD frame (np.ndarray)
+        Live video processing generator with zero-lag threaded camera capture,
+        automatic port discovery, cloud WebSocket tunnel, and local EdgeAsyncPipeline fallback.
         """
-        cap = self.open_camera(camera_source)
+        stream = ThreadedCameraStream(
+            camera_source=camera_source,
+            use_threading=True,
+            allow_demo_fallback=allow_demo_fallback,
+        )
         frame_count = 0
 
-        # Attempt to establish persistent WebSocket connection
         ws_conn = None
         if use_cloud and (self.server_url.startswith("ws://") or self.server_url.startswith("wss://")):
             try:
                 from websockets.sync.client import connect
-                ws_conn = connect(self.server_url, open_timeout=2.0)
+                ws_conn = connect(self.server_url, open_timeout=1.5)
             except Exception:
                 ws_conn = None
 
-        t_prev = time.perf_counter()
         fps = 0.0
         rtt_lat = 0.0
+        cached_results: Optional[List[Dict[str, Any]]] = None
+        last_det_count = 0
 
         try:
-            while cap.isOpened():
+            while stream.isOpened():
                 t_start = time.perf_counter()
-                ret, frame = cap.read()
+                ret, frame = stream.read()
                 if not ret or frame is None:
                     break
 
@@ -378,12 +445,31 @@ class CloudInferenceClient:
                 local_dets = self.detect_faces(frame)
 
                 cloud_res = None
+                mode_label = "COASTING"
                 if use_cloud and local_dets:
                     cloud_res, rtt_lat = self.query_cloud(local_dets, ws_conn=ws_conn)
+                    if cloud_res is not None:
+                        mode_label = "CLOUD-GPU"
+
+                # Automatic local Edge inference when cloud is disabled or unreachable
+                if cloud_res is None and self.enable_local_fallback and local_dets:
+                    need_fresh_infer = (
+                        cached_results is None
+                        or len(local_dets) != last_det_count
+                        or (frame_count % max(1, infer_interval) == 1)
+                    )
+                    if need_fresh_infer:
+                        t_inf = time.perf_counter()
+                        cloud_res = self.infer_locally(local_dets)
+                        rtt_lat = (time.perf_counter() - t_inf) * 1000.0
+                        cached_results = cloud_res
+                        last_det_count = len(local_dets)
+                    else:
+                        cloud_res = cached_results
+                    mode_label = f"LOCAL-EDGE (Port {stream.port_info.port})"
 
                 targets = self.update_local_tracks(local_dets=local_dets, cloud_results=cloud_res)
 
-                # Compute smoothed FPS
                 dt = time.perf_counter() - t_start
                 if dt > 0:
                     inst_fps = 1.0 / dt
@@ -395,19 +481,24 @@ class CloudInferenceClient:
                     fps=fps,
                     latency_ms=rtt_lat,
                     cloud_connected=(cloud_res is not None or not use_cloud),
+                    mode_label=mode_label,
                 )
 
                 if display:
-                    cv2.imshow("iVCam Biometric Target Locker HUD [Kaggle Cloud GPU]", hud_frame)
-                    if cv2.waitKey(1) & 0xFF == 27:  # ESC to quit
+                    cv2.imshow("Biometric Target Locker HUD [ConvNeXt-V2]", hud_frame)
+                    key = cv2.waitKey(1) & 0xFF
+                    if key in (27, ord("q"), ord("Q")):
                         break
+                    if key in (ord("c"), ord("C")):
+                        new_p = stream.switch_to_next_port()
+                        print(f"🔄 Switched camera port -> {new_p.port} [{new_p.backend_name}] ({new_p.device_name})")
 
                 yield hud_frame
 
                 if max_frames is not None and frame_count >= max_frames:
                     break
         finally:
-            cap.release()
+            stream.release()
             if ws_conn is not None:
                 try:
                     ws_conn.close()

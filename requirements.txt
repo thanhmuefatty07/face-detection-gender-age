@@ -1,11 +1,11 @@
-# Core dependencies
-ultralytics>=8.0.0
-opencv-python>=4.8.0
-Pillow>=9.0.0
-numpy<2.0.0
-timm>=0.9.0
+# Core Biometric & Deep Learning Runtime
 torch>=2.0.0
+timm>=0.9.0
+opencv-python>=4.8.0
+numpy>=1.24.0,<2.0.0
+scipy>=1.10.0
+Pillow>=9.0.0
+PyYAML>=6.0
 
-# Hardware acceleration (choose one)
-openvino>=2024.0.0         # Intel CPU/GPU
-# onnxruntime-directml     # AMD GPU (uncomment if using AMD)
+# Hardware Acceleration (CPU AVX2 / Intel iGPU)
+openvino>=2024.0.0

@@ -2,14 +2,15 @@
 models/*.pt
 models/*.onnx
 models/*.pth
+models/.ov_cache/
 !models/convnextv2_tiny_biometrics.pt
 !models/face_detection_yunet_2023mar.onnx
 kernel.errors.txt
 
-# Dataset - DO NOT UPLOAD (too large ~16k files)
+# Dataset & Reports - Keep on Kaggle
 images/
 labels/
-reports/kaggle_output/
+reports/
 *.jpg
 *.jpeg
 .agents/

@@ -1,22 +1,23 @@
 """
-2-Tier ByteTrack with 64-D Re-ID Appearance Recovery
-====================================================
-Production-grade multi-object tracker tailored for face biometrics:
+2-Tier ByteTrack with Vectorized 64-D Re-ID Appearance Recovery & Multi-Target Anti-Swap Gating
+===============================================================================================
+Production-grade multi-object tracker tailored for high-density face biometrics:
 1. Two-Tier Association:
-   - Tier 1: High-confidence detections (conf >= 0.6) matched with active tracks via IoU.
+   - Tier 1: High-confidence detections (conf >= 0.6) matched with active tracks via fused
+     IoU + 64-D Re-ID appearance cost (preventing ID swaps when multiple targets cross paths).
    - Tier 2: Low-confidence detections (0.2 <= conf < 0.6) matched with unmatched tracks to
      sustain tracking through motion blur and transient occlusion.
 2. 64-D Re-ID Cosine Matching:
    - Recovers lost tracks after full occlusion or subject turning back around.
    - Preserves unique persistent track_id without ID switches.
-3. Linear Kalman Box Filtering:
+3. Linear Kalman Box Filtering (Joseph Stabilized Form):
    - Predicts and smooths spatial bounding box motion states.
 """
 
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import IntEnum
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Tuple, Optional, Dict
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
@@ -46,24 +47,19 @@ class KalmanBoxTracker:
 
     def __init__(self, bbox: Tuple[float, float, float, float]):
         self.x = np.array([bbox[0], bbox[1], bbox[2], bbox[3], 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
-        # Covariance
         self.P = np.eye(8, dtype=np.float32) * 10.0
         self.P[4:, 4:] *= 100.0
 
-        # Motion matrix F
         self.F = np.eye(8, dtype=np.float32)
         for i in range(4):
             self.F[i, i + 4] = 1.0
 
-        # Measurement matrix H
         self.H = np.zeros((4, 8), dtype=np.float32)
         self.H[:4, :4] = np.eye(4, dtype=np.float32)
 
-        # Process noise Q
         self.Q = np.eye(8, dtype=np.float32) * 1.0
         self.Q[4:, 4:] *= 0.1
 
-        # Measurement noise R
         self.R = np.eye(4, dtype=np.float32) * 5.0
 
     def predict(self) -> Tuple[float, float, float, float]:
@@ -88,7 +84,6 @@ class KalmanBoxTracker:
     @property
     def current_bbox(self) -> Tuple[float, float, float, float]:
         x1, y1, x2, y2 = self.x[:4]
-        # Ensure x2 > x1, y2 > y1
         if x2 < x1:
             x1, x2 = x2, x1
         if y2 < y1:
@@ -170,32 +165,39 @@ class STrack:
         self.state = TrackState.Removed
 
 
-def compute_iou_matrix(boxes_a: List[Tuple[float, float, float, float]], boxes_b: List[Tuple[float, float, float, float]]) -> np.ndarray:
-    """Computes pairwise 1 - IoU distance matrix between two lists of bounding boxes."""
+def compute_iou_matrix(
+    boxes_a: List[Tuple[float, float, float, float]],
+    boxes_b: List[Tuple[float, float, float, float]],
+) -> np.ndarray:
+    """Computes vectorized pairwise 1 - IoU distance matrix between two lists of bounding boxes."""
     N = len(boxes_a)
     M = len(boxes_b)
     if N == 0 or M == 0:
         return np.empty((N, M), dtype=np.float32)
 
-    cost_matrix = np.ones((N, M), dtype=np.float32)
-    for i, a in enumerate(boxes_a):
-        area_a = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
-        for j, b in enumerate(boxes_b):
-            area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
-            xx1 = max(a[0], b[0])
-            yy1 = max(a[1], b[1])
-            xx2 = min(a[2], b[2])
-            yy2 = min(a[3], b[3])
-            w = max(0.0, xx2 - xx1)
-            h = max(0.0, yy2 - yy1)
-            inter = w * h
-            union = area_a + area_b - inter
-            iou = inter / (union + 1e-8) if union > 0 else 0.0
-            cost_matrix[i, j] = 1.0 - float(iou)
-    return cost_matrix
+    a = np.asarray(boxes_a, dtype=np.float32).reshape(N, 4)
+    b = np.asarray(boxes_b, dtype=np.float32).reshape(M, 4)
+
+    area_a = np.maximum(0.0, a[:, 2] - a[:, 0]) * np.maximum(0.0, a[:, 3] - a[:, 1])  # (N,)
+    area_b = np.maximum(0.0, b[:, 2] - b[:, 0]) * np.maximum(0.0, b[:, 3] - b[:, 1])  # (M,)
+
+    xx1 = np.maximum(a[:, None, 0], b[None, :, 0])
+    yy1 = np.maximum(a[:, None, 1], b[None, :, 1])
+    xx2 = np.minimum(a[:, None, 2], b[None, :, 2])
+    yy2 = np.minimum(a[:, None, 3], b[None, :, 3])
+
+    w = np.maximum(0.0, xx2 - xx1)
+    h = np.maximum(0.0, yy2 - yy1)
+    inter = w * h
+    union = area_a[:, None] + area_b[None, :] - inter
+    iou = np.where(union > 0.0, inter / (union + 1e-8), 0.0)
+    return (1.0 - iou).astype(np.float32)
 
 
-def compute_cosine_distance_matrix(feats_a: List[np.ndarray], feats_b: List[np.ndarray]) -> np.ndarray:
+def compute_cosine_distance_matrix(
+    feats_a: List[Optional[np.ndarray]],
+    feats_b: List[Optional[np.ndarray]],
+) -> np.ndarray:
     """Computes pairwise cosine distance (1 - cos) between two lists of Re-ID vectors."""
     N = len(feats_a)
     M = len(feats_b)
@@ -206,11 +208,14 @@ def compute_cosine_distance_matrix(feats_a: List[np.ndarray], feats_b: List[np.n
     for i, fa in enumerate(feats_a):
         if fa is None:
             continue
+        fa_vec = np.asarray(fa, dtype=np.float32).ravel()
         for j, fb in enumerate(feats_b):
             if fb is None:
                 continue
-            cos_sim = float(np.dot(fa, fb))
-            mat[i, j] = max(0.0, 1.0 - cos_sim)
+            fb_vec = np.asarray(fb, dtype=np.float32).ravel()
+            if fa_vec.shape == fb_vec.shape:
+                cos_sim = float(np.dot(fa_vec, fb_vec))
+                mat[i, j] = max(0.0, 1.0 - cos_sim)
     return mat
 
 
@@ -272,7 +277,26 @@ class ByteTracker:
         matched_dets_high_1 = set()
 
         if cost_m1.size > 0:
-            row_ind, col_ind = linear_sum_assignment(cost_m1)
+            # Fuse Re-ID cosine distance into Tier-1 assignment matrix when both sides have embeddings
+            # to disambiguate crossing trajectories of multiple simultaneous targets
+            assign_cost_1 = cost_m1.copy()
+            any_reid_t = any(t.reid_feat is not None for t in self.tracked_tracks)
+            any_reid_d = any(d.reid_feat is not None for d in dets_high)
+            if any_reid_t and any_reid_d and len(self.tracked_tracks) > 1 and len(dets_high) > 1:
+                reid_m1 = compute_cosine_distance_matrix(
+                    [t.reid_feat for t in self.tracked_tracks],
+                    [d.reid_feat for d in dets_high],
+                )
+                for r_i, trk in enumerate(self.tracked_tracks):
+                    if trk.reid_feat is None:
+                        continue
+                    for c_i, dt in enumerate(dets_high):
+                        if dt.reid_feat is None:
+                            continue
+                        if cost_m1[r_i, c_i] <= 0.8:
+                            assign_cost_1[r_i, c_i] = 0.80 * cost_m1[r_i, c_i] + 0.20 * reid_m1[r_i, c_i]
+
+            row_ind, col_ind = linear_sum_assignment(assign_cost_1)
             for r, c in zip(row_ind, col_ind):
                 # IoU threshold = 0.2 -> distance <= 0.8
                 if cost_m1[r, c] <= 0.8:
@@ -339,12 +363,9 @@ class ByteTracker:
                     is_iou_match = (cost_iou.size > 0 and cost_iou[r, c] <= 0.7)
 
                     if has_reid:
-                        # Strict Gated Matching: appearance cosine distance must be <= threshold (0.35).
-                        # Overlapping bounding boxes of distinct individuals (cost_reid > 0.35) are strictly rejected.
                         is_reid_match = (cost_reid[r, c] <= self.reid_thresh)
                         is_gated_match = is_reid_match
                     else:
-                        # Fallback to spatial IoU proximity only when no Re-ID features are registered
                         is_gated_match = is_iou_match
 
                     if is_gated_match:
@@ -354,7 +375,6 @@ class ByteTracker:
                         matched_lost.add(r)
                         matched_dets_reid.add(c)
 
-            # Keep remaining unmatched lost tracks
             self.lost_tracks = [
                 t for i, t in enumerate(self.lost_tracks) if i not in matched_lost
             ]
@@ -365,6 +385,14 @@ class ByteTracker:
             unmatched_dets_high_remaining = unmatched_dets_high
 
         # 6. Initialize new tracks for remaining high-confidence detections up to max_targets
+        # Sort by prominence (score * area^0.15) so primary subjects take priority when near capacity
+        if len(unmatched_dets_high_remaining) > 1:
+            unmatched_dets_high_remaining = sorted(
+                unmatched_dets_high_remaining,
+                key=lambda d: float(d.score) * (max(1.0, (d.bbox[2] - d.bbox[0]) * (d.bbox[3] - d.bbox[1])) ** 0.15),
+                reverse=True,
+            )
+
         new_stracks = []
         active_ids = {t.track_id for t in tracked_stracks} | {t.track_id for t in recovered_stracks}
         for d in unmatched_dets_high_remaining:
