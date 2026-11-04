@@ -128,13 +128,13 @@ mkdir -p "$ROOT_DIR/models"
 if [ ! -f "$ROOT_DIR/models/face_detection_yunet_2023mar.onnx" ]; then
     echo "[3.5/4] Downloading YuNet face detector model..."
     curl -L --fail -o "$ROOT_DIR/models/face_detection_yunet_2023mar.onnx" \
-        "https://raw.githubusercontent.com/Huy-VNNIC/face-detection-gender-age/main/models/face_detection_yunet_2023mar.onnx"
+        "https://github.com/thanhmuefatty07/face-detection-gender-age/raw/main/models/face_detection_yunet_2023mar.onnx"
 fi
 
 if [ ! -f "$ROOT_DIR/models/convnextv2_tiny_biometrics.pt" ]; then
     echo "[3.5/4] Downloading ConvNeXt-V2 Tiny biometric model..."
     curl -L --fail -o "$ROOT_DIR/models/convnextv2_tiny_biometrics.pt" \
-        "https://raw.githubusercontent.com/Huy-VNNIC/face-detection-gender-age/main/models/convnextv2_tiny_biometrics.pt"
+        "https://github.com/thanhmuefatty07/face-detection-gender-age/raw/main/models/convnextv2_tiny_biometrics.pt"
 fi
 
 # 7. Launch HUD
