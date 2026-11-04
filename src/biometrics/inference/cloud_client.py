@@ -88,35 +88,125 @@ class CloudInferenceClient:
             )
         return self._local_edge
 
+    @staticmethod
+    def _box_iou(
+        box_a: Tuple[float, float, float, float],
+        box_b: Tuple[float, float, float, float],
+    ) -> float:
+        xx1 = max(box_a[0], box_b[0])
+        yy1 = max(box_a[1], box_b[1])
+        xx2 = min(box_a[2], box_b[2])
+        yy2 = min(box_a[3], box_b[3])
+        inter = max(0.0, xx2 - xx1) * max(0.0, yy2 - yy1)
+        area_a = max(0.0, box_a[2] - box_a[0]) * max(0.0, box_a[3] - box_a[1])
+        area_b = max(0.0, box_b[2] - box_b[0]) * max(0.0, box_b[3] - box_b[1])
+        return float(inter / (area_a + area_b - inter + 1e-8))
+
+    def _match_detections_to_locked_tracks(
+        self,
+        local_dets: List[Dict[str, Any]],
+        iou_thresh: float = 0.25,
+    ) -> Dict[int, Any]:
+        """
+        Matches each detection in `local_dets` against already-locked active tracks using
+        both current and Kalman-predicted bounding boxes. Does not invalidate locked tracks
+        when another person enters or leaves (`lost_tracks` non-empty).
+        """
+        if not local_dets or not self.tracker.tracked_tracks:
+            return {}
+
+        det_boxes = [ld.get("bbox", (0.0, 0.0, 0.0, 0.0)) for ld in local_dets]
+        matched: Dict[int, Any] = {}
+        used_track_ids = set()
+
+        for d_idx, d_box in enumerate(det_boxes):
+            best_iou = iou_thresh
+            best_trk = None
+            second_iou = 0.0
+            for trk in self.tracker.tracked_tracks:
+                pred_box = trk.peek_predicted_bbox() if hasattr(trk, "peek_predicted_bbox") else trk.bbox
+                iou = max(self._box_iou(trk.bbox, d_box), self._box_iou(pred_box, d_box))
+                if trk.track_id in self.locker._measured_tracks and iou >= best_iou:
+                    second_iou = max(second_iou, best_iou if best_trk is not None else 0.0)
+                    best_iou = iou
+                    best_trk = trk
+                else:
+                    second_iou = max(second_iou, iou)
+
+            if best_trk is not None and second_iou < 0.20 and best_trk.track_id not in used_track_ids:
+                pred_best = best_trk.peek_predicted_bbox() if hasattr(best_trk, "peek_predicted_bbox") else best_trk.bbox
+                competing_det = any(
+                    other_idx != d_idx
+                    and max(
+                        self._box_iou(best_trk.bbox, other_box),
+                        self._box_iou(pred_best, other_box),
+                    ) >= 0.20
+                    for other_idx, other_box in enumerate(det_boxes)
+                )
+                if not competing_det:
+                    matched[d_idx] = best_trk
+                    used_track_ids.add(best_trk.track_id)
+
+        return matched
+
     def infer_locally(self, local_dets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Runs local ConvNeXt-V2 inference on detected face crops when cloud is offline or disabled."""
+        """
+        Runs local ConvNeXt-V2 inference on detected face crops when cloud is offline or disabled.
+        If some detections already belong to locked active tracks while a new person enters,
+        only infers the newly entering unlocked crop(s) and preserves cached Re-ID for locked tracks.
+        """
         if not local_dets:
             return []
         edge = self._get_local_edge()
+        locked_map = self._match_detections_to_locked_tracks(local_dets)
+        skip_locked = 0 < len(locked_map) < len(local_dets)
+
         crops_rgb: List[np.ndarray] = []
         env_mults: List[float] = []
-        for ld in local_dets:
+        infer_det_indices: List[int] = []
+        for idx, ld in enumerate(local_dets):
+            if skip_locked and (idx in locked_map or float(ld.get("score", 0.9)) < self.tracker.track_thresh):
+                continue
             crop_bgr = ld.get("crop")
             if crop_bgr is not None:
                 norm_bgr, env_info = self.env_normalizer.normalize_crop_for_inference(crop_bgr, is_bgr=True)
                 crops_rgb.append(cv2.cvtColor(norm_bgr, cv2.COLOR_BGR2RGB))
                 env_mults.append(float(env_info.get("uncertainty_multiplier", 1.0)))
+                infer_det_indices.append(idx)
 
         if not crops_rgb:
             return []
 
         ages, stds, g_logits, reids = edge._infer_crops(crops_rgb)
-        results: List[Dict[str, Any]] = []
-        for i in range(len(ages)):
+        inferred_by_idx: Dict[int, Dict[str, Any]] = {}
+        for i, det_idx in enumerate(infer_det_indices):
+            if i >= len(ages):
+                break
             g_logit = float(g_logits[i])
             g_prob = float(1.0 / (1.0 + np.exp(-np.clip(g_logit, -20.0, 20.0))))
-            results.append({
+            inferred_by_idx[det_idx] = {
                 "expected_age": float(ages[i]),
                 "aleatoric_std": float(stds[i]) * (env_mults[i] if i < len(env_mults) else 1.0),
                 "gender_logit": g_logit,
                 "gender_prob": g_prob,
                 "reid_embedding": reids[i].tolist() if reids[i] is not None else None,
-            })
+            }
+
+        if not skip_locked:
+            return [inferred_by_idx[idx] for idx in infer_det_indices if idx in inferred_by_idx]
+
+        results: List[Dict[str, Any]] = []
+        for idx in range(len(local_dets)):
+            if idx in inferred_by_idx:
+                results.append(inferred_by_idx[idx])
+            elif idx in locked_map:
+                trk = locked_map[idx]
+                results.append({
+                    "reid_embedding": trk.reid_feat.tolist() if trk.reid_feat is not None else None,
+                    "is_cached_lock": True,
+                })
+            else:
+                results.append({"is_cached_lock": True})
         return results
 
     def detect_faces(self, frame: np.ndarray) -> List[Dict[str, Any]]:
@@ -176,44 +266,20 @@ class CloudInferenceClient:
     def _all_detections_match_locked_tracks(
         self,
         local_dets: List[Dict[str, Any]],
-        iou_thresh: float = 0.45,
+        iou_thresh: float = 0.25,
     ) -> bool:
         """
-        Returns True if every detection in `local_dets` unambiguously matches a distinct
-        active track that already has a locked first-shot biometric measurement, and no
-        lost tracks are awaiting ReID recovery.
+        Returns True if every high-confidence detection in `local_dets` unambiguously matches
+        a distinct active track that already has a locked first-shot biometric measurement.
         """
         if not local_dets:
             return True
-        if len(self.tracker.lost_tracks) > 0:
-            return False
-        if len(self.tracker.tracked_tracks) < len(local_dets):
-            return False
-
-        used_track_ids = set()
-        for ld in local_dets:
-            b = ld.get("bbox", (0.0, 0.0, 0.0, 0.0))
-            best_iou = iou_thresh
-            best_tid = None
-            for t in self.tracker.tracked_tracks:
-                if t.track_id in used_track_ids:
-                    continue
-                if t.track_id not in self.locker._measured_tracks:
-                    continue
-                xx1 = max(t.bbox[0], b[0])
-                yy1 = max(t.bbox[1], b[1])
-                xx2 = min(t.bbox[2], b[2])
-                yy2 = min(t.bbox[3], b[3])
-                inter = max(0.0, xx2 - xx1) * max(0.0, yy2 - yy1)
-                area_t = max(0.0, t.bbox[2] - t.bbox[0]) * max(0.0, t.bbox[3] - t.bbox[1])
-                area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
-                iou = inter / (area_t + area_b - inter + 1e-8)
-                if iou >= best_iou:
-                    best_iou = iou
-                    best_tid = t.track_id
-            if best_tid is None:
+        matched = self._match_detections_to_locked_tracks(local_dets, iou_thresh=iou_thresh)
+        for idx, ld in enumerate(local_dets):
+            if float(ld.get("score", 0.9)) < self.tracker.track_thresh:
+                continue
+            if idx not in matched:
                 return False
-            used_track_ids.add(best_tid)
         return True
 
     def update_local_tracks(
@@ -225,6 +291,7 @@ class CloudInferenceClient:
         Associates cloud/local predictions with local detections and updates tracker & locker.
         Guarantees that the first target lock is immediately measured and subsequent frames stay rock-solid.
         """
+        locked_map = self._match_detections_to_locked_tracks(local_dets)
         if (
             cloud_results is None
             and self.enable_local_fallback
@@ -243,6 +310,8 @@ class CloudInferenceClient:
                 reid_raw = cloud_results[i].get("reid_embedding")
                 if reid_raw is not None:
                     reid_feat = np.array(reid_raw, dtype=np.float32)
+            elif i in locked_map and locked_map[i].reid_feat is not None:
+                reid_feat = locked_map[i].reid_feat
             tracker_dets.append(Detection(bbox=bbox, score=score, reid_feat=reid_feat, det_id=i))
 
         online_tracks = self.tracker.update(tracker_dets)
@@ -267,14 +336,7 @@ class CloudInferenceClient:
                         if idx in used_det_indices:
                             continue
                         b = ld.get("bbox", (0.0, 0.0, 0.0, 0.0))
-                        xx1 = max(t.bbox[0], b[0])
-                        yy1 = max(t.bbox[1], b[1])
-                        xx2 = min(t.bbox[2], b[2])
-                        yy2 = min(t.bbox[3], b[3])
-                        inter = max(0.0, xx2 - xx1) * max(0.0, yy2 - yy1)
-                        area_t = max(0.0, t.bbox[2] - t.bbox[0]) * max(0.0, t.bbox[3] - t.bbox[1])
-                        area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
-                        iou = inter / (area_t + area_b - inter + 1e-8)
+                        iou = self._box_iou(t.bbox, b)
                         if iou > best_iou:
                             best_iou = iou
                             best_idx = idx
@@ -282,7 +344,7 @@ class CloudInferenceClient:
                         matched_res = cloud_results[best_idx]
                         used_det_indices.add(best_idx)
 
-            if matched_res is not None:
+            if matched_res is not None and not matched_res.get("is_cached_lock", False) and "expected_age" in matched_res:
                 age_pred = float(matched_res.get("expected_age", 25.0))
                 std_pred = float(matched_res.get("aleatoric_std", 1.0))
                 g_logit = float(matched_res.get("gender_logit", 0.0))
@@ -383,6 +445,7 @@ class CloudInferenceClient:
     ) -> np.ndarray:
         """Renders clean HUD overlay displaying ONLY Gender and Age Range on locked target boxes."""
         hud_img = frame.copy()
+        img_h, img_w = hud_img.shape[:2]
 
         if show_telemetry:
             status_str = mode_label or ("ONLINE" if cloud_connected else "COASTING")
@@ -410,11 +473,22 @@ class CloudInferenceClient:
             age_iv = tgt.get("locked_age_interval") or get_fine_interval_for_age(age)[0]
             label = f"{gender} | {age_iv}"
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
-            cv2.rectangle(hud_img, (x1, max(0, y1 - th - 10)), (x1 + tw + 10, max(0, y1)), color, -1)
+            bx1 = max(0, min(x1, max(0, img_w - tw - 10)))
+            bx2 = min(img_w, bx1 + tw + 10)
+            if y1 >= th + 10:
+                by1 = y1 - th - 10
+                by2 = y1
+                text_y = y1 - 5
+            else:
+                by1 = max(0, y1)
+                by2 = min(img_h, by1 + th + 10)
+                text_y = min(img_h - 4, by1 + th + 4)
+
+            cv2.rectangle(hud_img, (bx1, by1), (bx2, by2), color, -1)
             cv2.putText(
                 hud_img,
                 label,
-                (x1 + 5, max(0, y1 - 5)),
+                (bx1 + 5, text_y),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,
                 (255, 255, 255),
@@ -473,16 +547,21 @@ class CloudInferenceClient:
         use_cloud: bool = True,
         allow_demo_fallback: bool = False,
         infer_interval: int = 2,
+        pre_scanned_info: Optional[Any] = None,
     ) -> Generator[np.ndarray, None, None]:
         """
         Live video processing generator with zero-lag threaded camera capture,
         automatic port discovery, cloud WebSocket tunnel, and local EdgeAsyncPipeline fallback.
         Locks targets on first acquisition and skips redundant re-inference once locked.
         """
+        if self.enable_local_fallback and not use_cloud:
+            self._get_local_edge()
+
         stream = ThreadedCameraStream(
             camera_source=camera_source,
             use_threading=True,
             allow_demo_fallback=allow_demo_fallback,
+            pre_scanned_info=pre_scanned_info,
         )
         frame_count = 0
 
@@ -493,10 +572,13 @@ class CloudInferenceClient:
                 ws_conn = connect(self.server_url, open_timeout=1.5)
             except Exception:
                 ws_conn = None
+            if ws_conn is None and self.enable_local_fallback:
+                self._get_local_edge()
 
         fps = 0.0
         rtt_lat = 0.0
-        has_local_edge_active = False
+        has_local_edge_active = self._local_edge is not None
+        win_name = "Biometric Target Locker HUD [ConvNeXt-V2]"
 
         try:
             while stream.isOpened():
@@ -517,11 +599,7 @@ class CloudInferenceClient:
 
                 # Automatic local Edge inference ONLY for newly appearing/unlocked targets
                 if cloud_res is None and self.enable_local_fallback and local_dets:
-                    need_fresh_infer = (
-                        not has_local_edge_active
-                        or not self._all_detections_match_locked_tracks(local_dets)
-                    )
-                    if need_fresh_infer:
+                    if not self._all_detections_match_locked_tracks(local_dets):
                         t_inf = time.perf_counter()
                         cloud_res = self.infer_locally(local_dets)
                         rtt_lat = (time.perf_counter() - t_inf) * 1000.0
@@ -547,13 +625,21 @@ class CloudInferenceClient:
                 )
 
                 if display:
-                    cv2.imshow("Biometric Target Locker HUD [ConvNeXt-V2]", hud_frame)
+                    cv2.imshow(win_name, hud_frame)
                     key = cv2.waitKey(1) & 0xFF
                     if key in (27, ord("q"), ord("Q")):
                         break
+                    if key in (ord("r"), ord("R")):
+                        self.locker.reset()
                     if key in (ord("c"), ord("C")):
                         new_p = stream.switch_to_next_port()
+                        self.locker.reset()
                         print(f"🔄 Switched camera port -> {new_p.port} [{new_p.backend_name}] ({new_p.device_name})")
+                    try:
+                        if cv2.getWindowProperty(win_name, cv2.WND_PROP_VISIBLE) < 1:
+                            break
+                    except Exception:
+                        pass
 
                 yield hud_frame
 
@@ -568,3 +654,4 @@ class CloudInferenceClient:
                     pass
             if display:
                 cv2.destroyAllWindows()
+

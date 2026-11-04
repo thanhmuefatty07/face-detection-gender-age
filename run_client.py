@@ -167,7 +167,7 @@ def main():
         f"[{best_cam.backend_name}] ({best_cam.device_name})"
     )
     print(f"🎯 Đa mục tiêu    : Tối đa {args.max_targets} khuôn mặt @ {args.target_size}x{args.target_size}")
-    print("💡 Phím tắt HUD   : [ESC]/[Q] Thoát | [C] Chuyển đổi cổng Camera")
+    print("💡 Phím tắt HUD   : [ESC]/[Q] Thoát | [C] Đổi cổng Camera | [R] Khóa lại (Re-lock)")
     print("=" * 72)
 
     client = CloudInferenceClient(
@@ -185,6 +185,7 @@ def main():
             display=not args.no_display,
             use_cloud=use_cloud,
             allow_demo_fallback=args.demo,
+            pre_scanned_info=best_cam,
         ):
             pass
     except KeyboardInterrupt:

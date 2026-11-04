@@ -432,11 +432,70 @@ def test_first_shot_target_lock_and_zero_post_lock_jumping():
         # Inference should have executed ONLY once on Frame 1 when the 3 targets first appeared!
         assert infer_calls == 1, f"Expected 1 first-shot inference call, got {infer_calls}"
 
+    # Verify aligned face crops from SyntheticMultiTargetStream are classified as 'clean'
+    # (NOT falsely distorted by backlight/blur normalization due to dark hair at the top of crop)
+    _, clean_frame = syn.read()
+    sample_dets = client.detect_faces(clean_frame)
+    assert len(sample_dets) == 3
+    for sd in sample_dets:
+        crop_info = client.env_normalizer.analyze(sd["crop"], is_bgr=True)
+        assert crop_info["regime"] == "clean", f"Clean aligned face crop misclassified as {crop_info['regime']}: {crop_info}"
+        assert crop_info["is_backlight"] is False and crop_info["is_blurry"] is False
+
+    # Verify multi-person entry & exit:
+    # Frame 1: Person 1 appears -> 1 crop inferred
+    # Frame 2: Person 2 enters alongside Person 1 -> ONLY 1 crop (Person 2) inferred, Person 1 is NOT re-inferred!
+    # Frames 3..8: Person 2 leaves (so tracker.lost_tracks is non-empty) -> 0 crops inferred for Person 1!
+    STrack.reset_counter()
+    client_mp = CloudInferenceClient(enable_local_fallback=True, target_size=224, device="auto")
+    edge_mp = client_mp._get_local_edge()
+    inferred_batch_sizes = []
+    orig_infer_crops = edge_mp._infer_crops
+
+    def tracked_infer_crops(crops):
+        inferred_batch_sizes.append(len(crops))
+        return orig_infer_crops(crops)
+
+    with patch.object(edge_mp, "_infer_crops", side_effect=tracked_infer_crops):
+        det_p1 = sample_dets[0]
+        det_p2 = sample_dets[1]
+        # Frame 1: Person 1 enters
+        t_f1 = client_mp.update_local_tracks([det_p1], cloud_results=None)
+        assert len(t_f1) == 1 and inferred_batch_sizes == [1]
+
+        # Frame 2: Person 2 enters while Person 1 stays locked
+        t_f2 = client_mp.update_local_tracks([det_p1, det_p2], cloud_results=None)
+        assert len(t_f2) == 2
+        assert inferred_batch_sizes == [1, 1], f"Expected only new target (1 crop) inferred on Frame 2, got {inferred_batch_sizes}"
+
+        # Frames 3..8: Person 2 leaves (lost_tracks is non-empty!), Person 1 moves slightly
+        for shift in range(1, 6):
+            b1 = det_p1["bbox"]
+            det_p1_moved = {
+                "bbox": (b1[0] + shift * 2.0, b1[1] + shift * 1.5, b1[2] + shift * 2.0, b1[3] + shift * 1.5),
+                "score": det_p1["score"],
+                "crop": det_p1["crop"],
+            }
+            t_fn = client_mp.update_local_tracks([det_p1_moved], cloud_results=None)
+            assert len(t_fn) == 1
+            assert len(client_mp.tracker.lost_tracks) == 1
+        assert inferred_batch_sizes == [1, 1], f"Redundant re-inference triggered when lost_tracks was non-empty: {inferred_batch_sizes}"
+
+    # Verify high-uncertainty initial lock (init_std > 4.0) upgrades once when a sharp measurement arrives
+    locker_unc = TargetLocker(lock_on_first_shot=True)
+    u1 = locker_unc.update(track_id=99, age_pred=31.0, aleatoric_std=4.6, gender_logit=0.6, has_measurement=True)
+    assert u1["locked_age_interval"] == "31-35"
+    u2 = locker_unc.update(track_id=99, age_pred=19.5, aleatoric_std=1.4, gender_logit=3.2, has_measurement=True)
+    assert u2["locked_age_interval"] == "18-21"
+    # Once upgraded to sharp std (1.4 <= 4.0), subsequent frames stay rock-solid
+    u3 = locker_unc.update(track_id=99, age_pred=24.0, aleatoric_std=1.8, gender_logit=2.5, has_measurement=True)
+    assert u3["locked_age_interval"] == "18-21"
+
 
 def test_clean_hud_displays_only_gender_and_age_range():
     """
-    Verifies HUD renders ONLY Gender and Age Range on locked target boxes and hides
-    cluttered telemetry banner by default.
+    Verifies HUD renders ONLY Gender and Age Range on locked target boxes, hides
+    cluttered telemetry banner by default, and clamps top-edge badges inside the frame.
     """
     client = CloudInferenceClient(enable_local_fallback=False)
     frame = np.full((480, 640, 3), 50, dtype=np.uint8)
@@ -458,6 +517,23 @@ def test_clean_hud_displays_only_gender_and_age_range():
     assert np.array_equal(hud[10:34, 10:320], frame[10:34, 10:320])
     # Target box region must have been drawn
     assert not np.array_equal(hud[110:285, 115:265], frame[110:285, 115:265])
+
+    # Top-edge face (y1 = 2) must render its badge inside the top of the box without clipping off-screen
+    top_targets = [
+        {
+            "track_id": 8,
+            "bbox": (200.0, 2.0, 320.0, 130.0),
+            "score": 0.95,
+            "locked_age": 27.0,
+            "locked_age_interval": "26-29",
+            "locked_age_interval_idx": 8,
+            "locked_gender": "Male",
+            "gender_prob": 0.08,
+            "aleatoric_std": 1.5,
+        }
+    ]
+    hud_top = client.render_hud(frame, top_targets)
+    assert np.any(hud_top[4:24, 202:300] == 255), "Top-edge target label text was clipped off-screen!"
 
 
 def test_macos_darwin_support_and_one_click_launchers():
@@ -489,4 +565,5 @@ def test_macos_darwin_support_and_one_click_launchers():
     for py_file in (ROOT_DIR / "src" / "biometrics").rglob("*.py"):
         content = py_file.read_text(encoding="utf-8")
         assert "mining" not in content, f"{py_file} still references mining!"
+
 

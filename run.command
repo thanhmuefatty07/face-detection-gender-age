@@ -12,8 +12,8 @@ set -u
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 cd "$ROOT_DIR" || exit 1
 
-# Ensure Homebrew & local binaries are in PATH when launched from macOS Finder GUI
-export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+# Ensure Homebrew, Python.framework, pyenv, conda & local binaries are in PATH when launched from macOS Finder GUI
+export PATH="/opt/homebrew/bin:/usr/local/bin:/Library/Frameworks/Python.framework/Versions/3.12/bin:/Library/Frameworks/Python.framework/Versions/3.11/bin:/Library/Frameworks/Python.framework/Versions/3.10/bin:$HOME/.pyenv/shims:$HOME/miniconda3/bin:$HOME/anaconda3/bin:$PATH"
 export PYTHONIOENCODING="utf-8"
 export OPENCV_LOG_LEVEL="OFF"
 

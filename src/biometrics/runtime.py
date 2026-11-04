@@ -474,7 +474,7 @@ class EnvironmentNormalizer:
         low_light_thresh: float = 68.0,
         overexposed_thresh: float = 195.0,
         color_cast_thresh: float = 14.0,
-        blur_laplacian_thresh: float = 75.0,
+        blur_laplacian_thresh: float = 26.0,
         blank_std_thresh: float = 2.0,
     ):
         self.low_light_thresh = float(low_light_thresh)
@@ -590,10 +590,25 @@ class EnvironmentNormalizer:
 
         shadow_ratio = float(np.mean(l_ch < 58.0))
         highlight_ratio = float(np.mean(l_ch > 230.0))
-        mid_w = max(1, l_ch.shape[1] // 2)
-        mid_h = max(1, l_ch.shape[0] // 2)
+        ph, pw = l_ch.shape[:2]
+        mid_w = max(1, pw // 2)
+        mid_h = max(1, ph // 2)
         hemi_asym = float(abs(np.mean(l_ch[:, :mid_w]) - np.mean(l_ch[:, mid_w:])))
         vert_asym = float(abs(np.mean(l_ch[:mid_h, :]) - np.mean(l_ch[mid_h:, :])))
+
+        # Evaluate inner facial skin region so dark hair/crown at the top of an aligned crop
+        # does not falsely trigger vertical backlight/shadow distortion on clean faces
+        ry1, ry2 = int(0.22 * ph), max(int(0.22 * ph) + 2, int(0.86 * ph))
+        rx1, rx2 = int(0.18 * pw), max(int(0.18 * pw) + 2, int(0.82 * pw))
+        inner_l = l_ch[ry1:ry2, rx1:rx2]
+        inner_mean_l = float(np.mean(inner_l)) if inner_l.size > 0 else mean_l
+        inner_shadow_ratio = float(np.mean(inner_l < 58.0)) if inner_l.size > 0 else shadow_ratio
+        inner_mid_h = max(1, inner_l.shape[0] // 2)
+        inner_vert_asym = (
+            float(abs(np.mean(inner_l[:inner_mid_h, :]) - np.mean(inner_l[inner_mid_h:, :])))
+            if inner_l.shape[0] >= 2
+            else vert_asym
+        )
 
         a_shift = float(np.mean(a_ch) - 128.0)
         b_shift = float(np.mean(b_ch) - 128.0)
@@ -603,13 +618,15 @@ class EnvironmentNormalizer:
         gray_u8 = lab[:, :, 0]
         lap_var = float(cv2.Laplacian(gray_u8, cv2.CV_64F).var())
 
-        is_low_light = (mean_l < self.low_light_thresh) or (mean_l < 85.0 and shadow_ratio > 0.45)
+        is_low_light = (mean_l < self.low_light_thresh) or (
+            mean_l < 85.0 and shadow_ratio > 0.45 and inner_mean_l < 85.0
+        )
         is_backlight = (
             (shadow_ratio > 0.25 and highlight_ratio > 0.06)
             or (hemi_asym > 26.0 and shadow_ratio > 0.10)
-            or (vert_asym > 32.0 and shadow_ratio > 0.10)
+            or (inner_vert_asym > 32.0 and inner_shadow_ratio > 0.15)
             or (hemi_asym > 38.0)
-            or (vert_asym > 44.0)
+            or (inner_vert_asym > 44.0 and inner_shadow_ratio > 0.08)
         )
         is_overexposed = (mean_l > self.overexposed_thresh) or (highlight_ratio > 0.14)
         # Trigger color cast when excess chrominance outside the physiological skin locus exceeds threshold
@@ -659,6 +676,7 @@ class EnvironmentNormalizer:
             "highlight_ratio": highlight_ratio,
             "hemi_asym": hemi_asym,
             "vert_asym": vert_asym,
+            "inner_vert_asym": inner_vert_asym,
             "a_shift": a_shift,
             "b_shift": b_shift,
             "excess_a": excess_a,
@@ -735,7 +753,7 @@ class EnvironmentNormalizer:
                 # Suppress dark sensor shot/read noise before gamma & CLAHE so noise isn't amplified into fake wrinkles
                 l_ch = cv2.bilateralFilter(l_ch, d=5, sigmaColor=16, sigmaSpace=16)
 
-            if info.get("hemi_asym", 0.0) > 22.0 or info.get("vert_asym", 0.0) > 28.0:
+            if info.get("hemi_asym", 0.0) > 22.0 or info.get("inner_vert_asym", info.get("vert_asym", 0.0)) > 28.0:
                 # Compensate directional raking shadow via smooth illumination envelope flattening
                 l_f = l_ch.astype(np.float32)
                 illum = cv2.GaussianBlur(l_f, (0, 0), sigmaX=24.0)
@@ -1009,6 +1027,8 @@ class CameraPortScanner:
                 last_frame = frm
                 if i >= max(1, warmup_frames) - 1 and float(np.std(frm)) > 2.0:
                     break
+            elif i < max_reads - 1:
+                time.sleep(0.025)
 
         if not read_ok or last_frame is None:
             return CameraPortInfo(
@@ -1106,7 +1126,7 @@ class CameraPortScanner:
                 consecutive_dead = 0
             else:
                 consecutive_dead += 1
-                if sys.platform == "darwin" and idx == 0:
+                if sys.platform == "darwin" and idx == 0 and len(os_names) <= 1:
                     break
                 if idx >= 2 and consecutive_dead >= 3 and len(os_names) <= idx:
                     break
@@ -1251,6 +1271,7 @@ class ThreadedCameraStream:
         max_scan_index: int = 5,
         use_threading: bool = True,
         allow_demo_fallback: bool = False,
+        pre_scanned_info: Optional[CameraPortInfo] = None,
     ):
         self.requested_source = camera_source
         self.max_scan_index = max_scan_index
@@ -1276,10 +1297,13 @@ class ThreadedCameraStream:
                 score=50.0,
             )
         else:
-            self.port_info = CameraPortScanner.find_best_camera_port(
-                preferred_source=camera_source,
-                max_index=max_scan_index,
-            )
+            if pre_scanned_info is not None and pre_scanned_info.can_read:
+                self.port_info = pre_scanned_info
+            else:
+                self.port_info = CameraPortScanner.find_best_camera_port(
+                    preferred_source=camera_source,
+                    max_index=max_scan_index,
+                )
             self.cap = self._open_from_info(self.port_info)
             if (self.cap is None or not self.cap.isOpened()) and allow_demo_fallback:
                 self.cap = SyntheticMultiTargetStream()

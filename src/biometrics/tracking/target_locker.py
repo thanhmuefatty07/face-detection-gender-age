@@ -248,11 +248,20 @@ class TargetLocker:
                 init_std = self._initial_stds.get(track_id, 1.0)
 
                 if self.lock_on_first_shot and init_std <= 5.0:
-                    # Keep the first-shot locked interval and gender rock-solid
-                    iv_name, iv_idx, iv_low, iv_high = prev_name, prev_idx, prev_low, prev_high
-                    gender_label = self.locked_genders.get(track_id, gender_label)
-                    locked_age = float(np.clip(locked_age, float(iv_low), float(iv_high)))
-                    self.age_filters[track_id].age = locked_age
+                    if init_std > 4.0 and valid_measurement and safe_std < min(2.5, 0.65 * init_std):
+                        # Upgrade an initially occluded/blurry first-shot lock once a sharp frontal view arrives
+                        self.age_filters[track_id].age = float(np.clip(float(age_pred), 0.0, 100.0))
+                        locked_age = self.age_filters[track_id].age
+                        iv_name, iv_idx, iv_low, iv_high = get_fine_interval_for_age(locked_age)
+                        if abs(float(gender_logit)) > 0.5:
+                            gender_label = "Female" if float(gender_logit) > 0.0 else "Male"
+                        self._initial_stds[track_id] = safe_std
+                    else:
+                        # Keep the first-shot locked interval and gender rock-solid
+                        iv_name, iv_idx, iv_low, iv_high = prev_name, prev_idx, prev_low, prev_high
+                        gender_label = self.locked_genders.get(track_id, gender_label)
+                        locked_age = float(np.clip(locked_age, float(iv_low), float(iv_high)))
+                        self.age_filters[track_id].age = locked_age
                 elif prev_idx != iv_idx:
                     in_deadband = (
                         (prev_low - 0.5 - self.interval_hysteresis_margin)
@@ -292,6 +301,16 @@ class TargetLocker:
         if track_id not in self.age_filters:
             return None
         return self.update(track_id=track_id, has_measurement=False)
+
+    def reset(self) -> None:
+        """Clears all locked target states so the next frame re-acquires fresh first-shot locks."""
+        self.age_filters.clear()
+        self.gender_accumulators.clear()
+        self.locked_intervals.clear()
+        self.locked_genders.clear()
+        self._initial_stds.clear()
+        self._candidate_counts.clear()
+        self._measured_tracks.clear()
 
     def prune_inactive(self, active_track_ids: List[int]) -> None:
         """Removes state trackers for tracks that are no longer active."""

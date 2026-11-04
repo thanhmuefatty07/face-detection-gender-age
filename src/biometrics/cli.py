@@ -102,27 +102,47 @@ def main():
             print(f"❌ Error: Cannot open camera '{args.webcam}'")
             sys.exit(1)
 
+        win_name = "SOTA Biometrics (Decoupled Dual-Engine)"
         try:
             while True:
                 ret, frame = stream.read()
                 if not ret or frame is None:
                     break
 
+                img_h, img_w = frame.shape[:2]
                 results = pipeline.process_frame(frame)
                 for det, audit, pred in results:
                     x, y, w, h = [int(v) for v in det.bbox.to_xywh()]
-                    color = (0, 255, 0) if (audit is None or audit.passed) else (0, 0, 255)
+                    if pred:
+                        color = (200, 50, 220) if pred.gender == "Female" else (240, 180, 40)
+                    else:
+                        color = (0, 255, 0) if (audit is None or audit.passed) else (0, 0, 255)
                     cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
                     if pred:
                         label = f"{pred.gender} | {pred.age_interval_name}"
-                        cv2.putText(frame, label, (x, max(20, y - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+                        bx1 = max(0, min(x, max(0, img_w - tw - 10)))
+                        bx2 = min(img_w, bx1 + tw + 10)
+                        if y >= th + 10:
+                            by1, by2, ty = y - th - 10, y, y - 5
+                        else:
+                            by1 = max(0, y)
+                            by2 = min(img_h, by1 + th + 10)
+                            ty = min(img_h - 4, by1 + th + 4)
+                        cv2.rectangle(frame, (bx1, by1), (bx2, by2), color, -1)
+                        cv2.putText(frame, label, (bx1 + 5, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
 
-                cv2.imshow("SOTA Biometrics (Decoupled Dual-Engine)", frame)
+                cv2.imshow(win_name, frame)
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), ord("Q"), 27):
                     break
                 if key in (ord("c"), ord("C")):
                     stream.switch_to_next_port()
+                try:
+                    if cv2.getWindowProperty(win_name, cv2.WND_PROP_VISIBLE) < 1:
+                        break
+                except Exception:
+                    pass
         finally:
             stream.release()
             cv2.destroyAllWindows()

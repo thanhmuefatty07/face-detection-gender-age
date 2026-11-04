@@ -123,6 +123,19 @@ class EdgeAsyncPipeline:
         self.tracker = ByteTracker(max_targets=self.max_targets)
         self.locker = TargetLocker()
 
+        # 5. Pre-warm PyTorch/MPS/CUDA execution kernels when OpenVINO didn't already run a warmup pass
+        self.warmup()
+
+    def warmup(self) -> None:
+        """Pre-warms neural inference kernels so the first target acquisition has zero compilation lag."""
+        if self.ov_compiled_model is not None:
+            return
+        try:
+            dummy_crop = np.zeros((self.target_size, self.target_size, 3), dtype=np.uint8)
+            self._infer_single_batch([dummy_crop], enable_flip_tta=False)
+        except Exception:
+            pass
+
     def _init_openvino(self, target_device: str = "CPU"):
         """Initializes and compiles OpenVINO execution engine with persistent IR & blob caching."""
         try:
@@ -386,48 +399,62 @@ class EdgeAsyncPipeline:
             all_reids.extend(reids)
         return all_ages, all_stds, all_g_logits, all_reids
 
+    @staticmethod
+    def _box_iou(
+        box_a: Tuple[float, float, float, float],
+        box_b: Tuple[float, float, float, float],
+    ) -> float:
+        xx1 = max(box_a[0], box_b[0])
+        yy1 = max(box_a[1], box_b[1])
+        xx2 = min(box_a[2], box_b[2])
+        yy2 = min(box_a[3], box_b[3])
+        inter = max(0.0, xx2 - xx1) * max(0.0, yy2 - yy1)
+        area_a = max(0.0, box_a[2] - box_a[0]) * max(0.0, box_a[3] - box_a[1])
+        area_b = max(0.0, box_b[2] - box_b[0]) * max(0.0, box_b[3] - box_b[1])
+        return float(inter / (area_a + area_b - inter + 1e-8))
+
     def _match_locked_tracks_by_iou(
         self,
         det_boxes: List[Tuple[float, float, float, float]],
     ) -> Dict[int, Any]:
         """
-        Identifies detections that unambiguously match an already-locked active track
-        (IoU >= 0.45, no competing detections or lost tracks) so we do not re-run
-        redundant neural inference on already-locked targets.
+        Per-detection matching against already-locked active tracks using both current and
+        Kalman-predicted bounding boxes (IoU >= 0.25, no competing detections or overlapping tracks).
+        Allows newly entering faces to be inferred without re-inferring already-locked faces,
+        and without re-inferring locked faces when another person leaves (`lost_tracks` non-empty).
         """
-        if not det_boxes or not self.tracker.tracked_tracks or len(self.tracker.lost_tracks) > 0:
-            return {}
-        if not all(t.track_id in self.locker._measured_tracks for t in self.tracker.tracked_tracks):
+        if not det_boxes or not self.tracker.tracked_tracks:
             return {}
 
         matched: Dict[int, Any] = {}
         used_track_ids = set()
         for d_idx, d_box in enumerate(det_boxes):
-            best_iou = 0.45
+            best_iou = 0.25
             best_trk = None
             second_iou = 0.0
             for trk in self.tracker.tracked_tracks:
-                t_box = trk.bbox
-                xx1 = max(t_box[0], d_box[0])
-                yy1 = max(t_box[1], d_box[1])
-                xx2 = min(t_box[2], d_box[2])
-                yy2 = min(t_box[3], d_box[3])
-                inter = max(0.0, xx2 - xx1) * max(0.0, yy2 - yy1)
-                area_t = max(0.0, t_box[2] - t_box[0]) * max(0.0, t_box[3] - t_box[1])
-                area_d = max(0.0, d_box[2] - d_box[0]) * max(0.0, d_box[3] - d_box[1])
-                iou = inter / (area_t + area_d - inter + 1e-8)
-                if iou > best_iou:
-                    second_iou = best_iou if best_trk is not None else second_iou
+                pred_box = trk.peek_predicted_bbox() if hasattr(trk, "peek_predicted_bbox") else trk.bbox
+                iou = max(self._box_iou(trk.bbox, d_box), self._box_iou(pred_box, d_box))
+                if trk.track_id in self.locker._measured_tracks and iou >= best_iou:
+                    second_iou = max(second_iou, best_iou if best_trk is not None else 0.0)
                     best_iou = iou
                     best_trk = trk
-                elif iou > second_iou:
-                    second_iou = iou
+                else:
+                    second_iou = max(second_iou, iou)
 
             if best_trk is not None and second_iou < 0.20 and best_trk.track_id not in used_track_ids:
-                matched[d_idx] = best_trk
-                used_track_ids.add(best_trk.track_id)
-            else:
-                return {}
+                pred_best = best_trk.peek_predicted_bbox() if hasattr(best_trk, "peek_predicted_bbox") else best_trk.bbox
+                competing_det = any(
+                    other_idx != d_idx
+                    and max(
+                        self._box_iou(best_trk.bbox, other_box),
+                        self._box_iou(pred_best, other_box),
+                    ) >= 0.20
+                    for other_idx, other_box in enumerate(det_boxes)
+                )
+                if not competing_det:
+                    matched[d_idx] = best_trk
+                    used_track_ids.add(best_trk.track_id)
         return matched
 
     def process_frame(self, frame: np.ndarray) -> List[Dict[str, Any]]:
@@ -449,6 +476,8 @@ class EdgeAsyncPipeline:
 
         for i, d in enumerate(raw_dets):
             if i in locked_det_map:
+                continue
+            if float(d.get("score", 0.9)) < self.tracker.track_thresh:
                 continue
             crop_rgb = None
             lmks = d.get("landmarks")

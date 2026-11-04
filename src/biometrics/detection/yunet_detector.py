@@ -121,12 +121,25 @@ class YuNetFaceDetector(FaceDetectorBase):
             pass
         return []
 
+    @staticmethod
+    def _compute_iou(a: FaceDetection, b: FaceDetection) -> float:
+        ax1, ay1 = a.bbox.x, a.bbox.y
+        ax2, ay2 = ax1 + a.bbox.width, ay1 + a.bbox.height
+        a_area = max(1.0, a.bbox.width * a.bbox.height)
+        bx1, by1 = b.bbox.x, b.bbox.y
+        bx2, by2 = bx1 + b.bbox.width, by1 + b.bbox.height
+        b_area = max(1.0, b.bbox.width * b.bbox.height)
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+        return float(inter / (a_area + b_area - inter + 1e-6))
+
     def _nms_and_rank(self, detections: List[FaceDetection]) -> List[FaceDetection]:
         """Applies IoU Non-Maximum Suppression across multi-scale detections and ranks by prominence."""
         if len(detections) <= 1:
             return detections
 
-        # Sort by confidence * (area ** 0.25) so high-confidence prominent faces lead
+        # Sort by confidence * (area ** 0.15) so high-confidence prominent faces lead
         scored = sorted(
             detections,
             key=lambda d: float(d.bbox.confidence) * (max(1.0, d.bbox.width * d.bbox.height) ** 0.15),
@@ -134,22 +147,7 @@ class YuNetFaceDetector(FaceDetectorBase):
         )
         kept: List[FaceDetection] = []
         for cand in scored:
-            cx1, cy1 = cand.bbox.x, cand.bbox.y
-            cx2, cy2 = cx1 + cand.bbox.width, cy1 + cand.bbox.height
-            c_area = max(1.0, cand.bbox.width * cand.bbox.height)
-            duplicate = False
-            for k in kept:
-                kx1, ky1 = k.bbox.x, k.bbox.y
-                kx2, ky2 = kx1 + k.bbox.width, ky1 + k.bbox.height
-                k_area = max(1.0, k.bbox.width * k.bbox.height)
-                ix1, iy1 = max(cx1, kx1), max(cy1, ky1)
-                ix2, iy2 = min(cx2, kx2), min(cy2, ky2)
-                inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
-                iou = inter / (c_area + k_area - inter + 1e-6)
-                if iou > self.nms_threshold:
-                    duplicate = True
-                    break
-            if not duplicate:
+            if all(self._compute_iou(cand, k) <= self.nms_threshold for k in kept):
                 kept.append(cand)
         return kept
 
@@ -180,15 +178,17 @@ class YuNetFaceDetector(FaceDetectorBase):
             if env_info["is_blank"]:
                 return []
 
-            results = self._run_yunet_pass(
-                work_img,
-                orig_w=w,
-                orig_h=h,
-                conf_thresh=self.confidence_threshold,
+            results = self._nms_and_rank(
+                self._run_yunet_pass(
+                    work_img,
+                    orig_w=w,
+                    orig_h=h,
+                    conf_thresh=self.confidence_threshold,
+                )
             )
 
             # 2. Close-up pyramid pass at 320px scale: catches large foreground faces (>250px)
-            #    even when smaller background faces were already detected in the primary pass.
+            #    without overwriting higher-precision primary pass bboxes/landmarks.
             if max(h, w) > 360:
                 scale_small = 320.0 / float(max(h, w))
                 small_img = cv2.resize(
@@ -202,8 +202,9 @@ class YuNetFaceDetector(FaceDetectorBase):
                     orig_h=h,
                     conf_thresh=max(0.45, self.confidence_threshold * 0.9),
                 )
-                if small_dets:
-                    results.extend(small_dets)
+                for cand in small_dets:
+                    if all(self._compute_iou(cand, k) <= self.nms_threshold for k in results):
+                        results.append(cand)
 
             # 3. Multi-environment photometric enhancement pass (dark/backlit/glare/color-cast):
             #    Recovers shadowed or backlit faces even if a bright foreground face was already found.
@@ -221,8 +222,9 @@ class YuNetFaceDetector(FaceDetectorBase):
                     orig_h=h,
                     conf_thresh=max(0.42, self.confidence_threshold * 0.85),
                 )
-                if env_dets:
-                    results.extend(env_dets)
+                for cand in env_dets:
+                    if all(self._compute_iou(cand, k) <= self.nms_threshold for k in results):
+                        results.append(cand)
 
             if results:
                 return self._nms_and_rank(results)

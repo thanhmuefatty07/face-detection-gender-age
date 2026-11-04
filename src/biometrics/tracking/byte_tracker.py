@@ -48,7 +48,7 @@ class KalmanBoxTracker:
     def __init__(self, bbox: Tuple[float, float, float, float]):
         self.x = np.array([bbox[0], bbox[1], bbox[2], bbox[3], 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
         self.P = np.eye(8, dtype=np.float32) * 2.0
-        self.P[4:, 4:] = np.eye(4, dtype=np.float32) * 10.0
+        self.P[4:, 4:] = np.eye(4, dtype=np.float32) * 2.0
 
         self.F = np.eye(8, dtype=np.float32)
         for i in range(4):
@@ -62,6 +62,16 @@ class KalmanBoxTracker:
 
         self.R = np.eye(4, dtype=np.float32) * 3.0
 
+    def peek_predicted_bbox(self) -> Tuple[float, float, float, float]:
+        """Returns next-frame predicted bbox without mutating filter state."""
+        x_next = self.x[:4] + 0.70 * self.x[4:]
+        x1, y1, x2, y2 = float(x_next[0]), float(x_next[1]), float(x_next[2]), float(x_next[3])
+        if x2 < x1:
+            x1, x2 = x2, x1
+        if y2 < y1:
+            y1, y2 = y2, y1
+        return x1, y1, x2, y2
+
     def predict(self) -> Tuple[float, float, float, float]:
         self.x[4:] *= 0.70
         self.x = self.F @ self.x
@@ -71,9 +81,9 @@ class KalmanBoxTracker:
     def update(self, bbox: Tuple[float, float, float, float]):
         z = np.array(bbox, dtype=np.float32)
         y = z - self.H @ self.x
-        if float(np.max(np.abs(y))) < 1.5:
-            y = y * 0.25
-            self.x[4:] *= 0.25
+        if float(np.max(np.abs(y))) < 3.0:
+            y = y * 0.20
+            self.x[4:] *= 0.20
         S = self.H @ self.P @ self.H.T + self.R
         try:
             K = self.P @ self.H.T @ np.linalg.pinv(S)
@@ -128,6 +138,9 @@ class STrack:
     @classmethod
     def reset_counter(cls):
         cls._count = 0
+
+    def peek_predicted_bbox(self) -> Tuple[float, float, float, float]:
+        return self.kalman.peek_predicted_bbox()
 
     def predict(self):
         pred_box = self.kalman.predict()
