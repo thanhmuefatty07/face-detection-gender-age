@@ -3,8 +3,8 @@ Kaggle Cloud Inference Server
 =============================
 High-throughput FastAPI + WebSocket inference server for Kaggle Dual Tesla T4 GPUs:
 - Runs batched ConvNeXt-V2 FP16 inference in < 15ms.
-- Accepts compressed 160x160 JPEG face crops over WebSocket or REST.
-- Returns 101-bin age expectation, gender probability, aleatoric uncertainty, and 64-D Re-ID embeddings.
+- Accepts compressed 224x224 (or 160x160) JPEG face crops over WebSocket or REST.
+- Returns 101-bin age expectation, 23-interval brackets, gender probability, uncertainty, and 64-D Re-ID embeddings.
 - Reverse tunnel helper for secure Cloudflare / ngrok public endpoint exposure.
 """
 
@@ -138,7 +138,10 @@ def create_inference_app(
             model = BiometricMultiTaskModel(backbone_name="convnextv2_tiny", pretrained=False)
             ckpt = torch.load(found_ckpt, map_location=device, weights_only=False)
             state_dict = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
-            model.load_state_dict(state_dict, strict=False)
+            try:
+                model.load_state_dict(state_dict, strict=True)
+            except RuntimeError:
+                model.load_state_dict(state_dict, strict=False)
         else:
             model = BiometricMultiTaskModel(backbone_name="convnextv2_nano", pretrained=False)
         model.to(device)

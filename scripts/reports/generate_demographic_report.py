@@ -56,7 +56,7 @@ def analyze_demographics(manifest_path: Path, output_md_path: Path) -> str:
 
     report = f"""# Báo Cáo Phân Tích Thống Kê Nhân Khẩu Học (Demographic & Statistical Report)
 
-**Tệp nguồn**: `{manifest_path}`  
+**Tệp nguồn**: `{manifest_path.as_posix()}`  
 **Tổng số mẫu thẩm định**: {total:,}  
 
 ---
@@ -71,7 +71,22 @@ def analyze_demographics(manifest_path: Path, output_md_path: Path) -> str:
 
 ---
 
-## 2. Phân Bổ 10 Nhóm Tuổi Rời Rạc (10-Cohort Group Breakdown)
+## 2. Phân Bổ 23 Khoảng Tuổi Chi Tiết 3–5 Năm (23 Fine Age Intervals)
+| Chỉ số | Khoảng tuổi | Số lượng mẫu | Tỷ lệ (%) |
+|---|---|---|---|
+"""
+    iv_col = 'age_interval' if 'age_interval' in df else ('age_interval_name' if 'age_interval_name' in df else None)
+    if iv_col:
+        from src.mining.intervals import FINE_AGE_INTERVALS
+        for idx, (iv_name, _, _) in enumerate(FINE_AGE_INTERVALS):
+            cnt = int((df[iv_col] == iv_name).sum())
+            pct = (cnt / max(1, total)) * 100
+            report += f"| {idx} | `{iv_name}` | {cnt:,} | {pct:.2f}% |\n"
+
+    report += """
+---
+
+## 3. Phân Bổ 10 Nhóm Tuổi Sinh Học (10-Cohort Group Breakdown)
 | Nhóm tuổi | Tên nhóm | Số lượng mẫu | Tỷ lệ (%) |
 |---|---|---|---|
 """
@@ -85,7 +100,19 @@ def analyze_demographics(manifest_path: Path, output_md_path: Path) -> str:
     report += """
 ---
 
-## 3. Cân Bằng Giới Tính (Gender Distribution)
+## 4. Phân Bổ Theo 13 Bộ Dữ Liệu Thực Tế (Benchmark Dataset Sources)
+| Bộ dữ liệu (`source_dataset`) | Số lượng | Tỷ lệ (%) |
+|---|---|---|
+"""
+    src_col = 'source_dataset' if 'source_dataset' in df else ('dataset_source' if 'dataset_source' in df else None)
+    if src_col:
+        for src_name, cnt in df[src_col].value_counts().items():
+            report += f"| `{src_name}` | {cnt:,} | {cnt / max(1, total) * 100:.2f}% |\n"
+
+    report += """
+---
+
+## 5. Cân Bằng Giới Tính (Gender Distribution)
 | Giới tính | Số lượng | Tỷ lệ (%) |
 |---|---|---|
 """
@@ -95,7 +122,7 @@ def analyze_demographics(manifest_path: Path, output_md_path: Path) -> str:
     report += """
 ---
 
-## 4. Phân Bổ Chủng Tộc & Sắc Tộc (Ethnic Demographics)
+## 6. Phân Bổ Chủng Tộc & Sắc Tộc (Ethnic Demographics)
 | Nhóm nhân khẩu / Chủng tộc | Số lượng | Tỷ lệ (%) |
 |---|---|---|
 """
@@ -105,7 +132,7 @@ def analyze_demographics(manifest_path: Path, output_md_path: Path) -> str:
     report += """
 ---
 
-## 5. Phân Vùng Dữ Liệu Không Rò Rỉ (Split Isolation)
+## 7. Phân Vùng Dữ Liệu Không Rò Rỉ (Split Isolation)
 | Phân vùng (Split) | Số lượng | Tỷ lệ (%) |
 |---|---|---|
 """
@@ -115,7 +142,7 @@ def analyze_demographics(manifest_path: Path, output_md_path: Path) -> str:
     report += """
 ---
 
-## 6. Đánh Giá Trọng Số Dị Hình Sinh Học (Dimorphism Loss Reweighting)
+## 8. Đánh Giá Trọng Số Dị Hình Sinh Học (Dimorphism Loss Reweighting)
 """
     if dim_col:
         mean_dim = float(df[dim_col].mean())

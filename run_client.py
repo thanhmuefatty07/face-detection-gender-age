@@ -47,6 +47,12 @@ def main():
         help="Maximum simultaneous locked face targets (default: 5)",
     )
     parser.add_argument(
+        "--target-size",
+        type=int,
+        default=224,
+        help="Canonical Umeyama alignment resolution (default: 224)",
+    )
+    parser.add_argument(
         "--no-cloud",
         action="store_true",
         help="Disable cloud server communication and run in local coasting mode",
@@ -63,13 +69,14 @@ def main():
     print("🚀 iVCam Biometric Target Locker [ConvNeXt-V2 Kaggle Cloud]")
     print(f"📡 Cloud Endpoint : {args.server}")
     print(f"📷 Camera Source  : {cam_source} (DirectShow low-latency)")
-    print(f"🎯 Target Density : Max {args.max_targets} subjects")
+    print(f"🎯 Target Density : Max {args.max_targets} subjects @ {args.target_size}x{args.target_size}")
     print("=" * 70)
     print("💡 Nhấn phím [ESC] trên cửa sổ video để dừng chương trình.")
 
     client = CloudInferenceClient(
         server_url=args.server,
         max_targets=args.max_targets,
+        target_size=args.target_size,
     )
 
     try:

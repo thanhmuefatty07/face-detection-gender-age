@@ -3,9 +3,9 @@ Unified Biometric Inference Pipeline
 ====================================
 End-to-end inference integrating:
 1. Dual-Engine Detection (SCRFD or YuNet) -> 5-point landmarks
-2. Umeyama similarity transform -> 160x160 canonical alignment
+2. Umeyama similarity transform -> 224x224 (or 160x160) canonical alignment
 3. Extreme quality auditing -> rejection or acceptance flag
-4. Multi-Task Biometric Estimator -> Continuous LDL Age, Dimorphism-weighted Gender, Uncertainty
+4. Multi-Task Biometric Estimator -> Continuous LDL Age, 23 Fine Intervals, Dimorphism Gender, Uncertainty
 """
 
 from __future__ import annotations
@@ -38,11 +38,14 @@ class BiometricPipeline:
         enable_quality_audit: bool = True,
         estimator_model: Optional[Any] = None,
         enable_flip_tta: bool = True,
-        target_size: int = 160,
+        target_size: Optional[int] = None,
         checkpoint_path: Optional[Any] = None,
         device: str = "cpu",
     ):
-        self.target_size = int(target_size)
+        if target_size is None:
+            self.target_size = 224 if checkpoint_path is not None else 160
+        else:
+            self.target_size = int(target_size)
         self.detector_engine = detector_engine.lower()
         if self.detector_engine == "scrfd":
             self.detector: FaceDetectorBase = SCRFDFaceDetector(
@@ -69,7 +72,10 @@ class BiometricPipeline:
                 ckpt = torch.load(ckpt_file, map_location=device, weights_only=False)
                 state_dict = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
                 estimator_model = BiometricMultiTaskModel(backbone_name="convnextv2_tiny", pretrained=False)
-                estimator_model.load_state_dict(state_dict, strict=False)
+                try:
+                    estimator_model.load_state_dict(state_dict, strict=True)
+                except RuntimeError:
+                    estimator_model.load_state_dict(state_dict, strict=False)
                 estimator_model.to(device)
                 estimator_model.eval()
         self.estimator_model = estimator_model

@@ -1,8 +1,9 @@
-# Models (Large files)
+# Models (Track canonical Student & YuNet weights; ignore scratch checkpoints)
 models/*.pt
 models/*.onnx
 models/*.pth
-!models/.gitkeep
+!models/convnextv2_tiny_biometrics.pt
+!models/face_detection_yunet_2023mar.onnx
 kernel.errors.txt
 
 # Dataset - DO NOT UPLOAD (too large ~16k files)

@@ -17,7 +17,8 @@
 - **Da đen (African)**:
   - Nồng độ eumelanin cao cung cấp độ bảo vệ tự nhiên SPF > 13, trì hoãn nếp nhăn bề mặt từ 10-15 năm.
 
-## 3. Học Phân Phối Nhãn (Label Distribution Learning - LDL)
-- Ánh xạ tuổi liên tục sang 10 bins xác suất qua tích phân hàm Gauss $\text{erf}$ và hàm Laplace.
-- Tổng xác suất trên 10 nhóm luôn chuẩn hóa bằng $1.0$ trên không gian simplex.
-- Sử dụng hàm mất mát khoảng cách Wasserstein (Earth Mover's Distance - EMD) kết hợp KL Divergence bảo toàn trật tự khoảng cách thứ bậc giữa các nhóm tuổi.
+## 3. Học Phân Phối Nhãn Phân Cấp (Hierarchical Label Distribution Learning - LDL)
+- **101-Bin Continuous LDL ($0\text{--}100$ tuổi)**: Ánh xạ tuổi thực và khoảng tuổi sang phân phối xác suất liên tục 101 bins ($\Delta = 1$ năm) kết hợp tinh chỉnh từ Teacher (`convnextv2_base`).
+- **23 Khoảng Tuổi Chi Tiết ($3\text{--}5$ năm)**: Tích hợp chính xác qua ma trận phân hoạch nhị phân $M \in \{0,1\}^{101 \times 23}$ (`0-2`, `3-5`, ..., `96-100`) và cửa sổ tập trung Gauss ($\sigma = 1.6$).
+- **10 Nhóm Tuổi Sinh Học (10 Biological Cohorts)**: Tích phân hàm Gauss $\text{erf}$ và Laplace chuẩn hóa bằng $1.0$ trên không gian simplex.
+- **Hàm Mất Mát Thứ Bậc**: Kết hợp KL Divergence, Jensen-Shannon Consistency, và khoảng cách Wasserstein $W_1$ (Earth Mover's Distance - EMD) bảo toàn trật tự khoảng cách giữa các độ tuổi.

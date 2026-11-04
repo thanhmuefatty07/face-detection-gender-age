@@ -29,7 +29,14 @@ def main():
 
     print(f"✅ {out}")
 
-    kernel_id = "vnthanhphm/face-dataset-mining-extreme-filtering-pipeline"
+    import json
+    meta_path = notebook_dir / "kernel-metadata.json"
+    kernel_id = "thanhmuefatty/face-dataset-mining-extreme-filtering-pipeline"
+    if meta_path.exists():
+        try:
+            kernel_id = json.loads(meta_path.read_text(encoding="utf-8")).get("id", kernel_id)
+        except Exception:
+            pass
     print(f"⏳ Monitoring status for {kernel_id}...")
 
     if "--push-only" in sys.argv:

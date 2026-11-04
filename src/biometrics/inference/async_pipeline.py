@@ -34,21 +34,24 @@ class EdgeAsyncPipeline:
 
     def __init__(
         self,
-        backbone_name: str = "convnextv2_nano",
+        backbone_name: str = "convnextv2_tiny",
         max_targets: int = 5,
         use_openvino: bool = False,
         device: str = "cpu",
         yunet_model_path: Optional[str | Path] = None,
         enable_flip_tta: bool = True,
         checkpoint_path: Optional[str | Path] = None,
-        target_size: int = 160,
+        target_size: Optional[int] = None,
     ):
         self.backbone_name = backbone_name
         self.max_targets = max_targets
         self.device = device
         self.use_openvino = use_openvino
         self.enable_flip_tta = enable_flip_tta
-        self.target_size = int(target_size)
+        if target_size is None:
+            self.target_size = 224 if backbone_name == "convnextv2_tiny" else 160
+        else:
+            self.target_size = int(target_size)
 
         # 1. Initialize local PyTorch model
         self.model = BiometricMultiTaskModel(backbone_name=backbone_name, pretrained=False)
@@ -59,7 +62,10 @@ class EdgeAsyncPipeline:
         if checkpoint_path is not None and Path(checkpoint_path).exists():
             ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
             state_dict = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
-            self.model.load_state_dict(state_dict, strict=False)
+            try:
+                self.model.load_state_dict(state_dict, strict=True)
+            except RuntimeError:
+                self.model.load_state_dict(state_dict, strict=False)
         self.model.to(self.device)
         self.model.eval()
 

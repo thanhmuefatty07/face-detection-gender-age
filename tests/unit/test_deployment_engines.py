@@ -381,4 +381,30 @@ class TestEdgeAsyncPipeline:
             assert len(per_source) == 11
             assert sum(v["count"] for v in per_source.values()) == 764
 
+    def test_default_student_checkpoint_auto_resolution_and_github_size_limit(self):
+        """Verifies default 224x224 Student checkpoint loading across EdgeAsyncPipeline, BiometricPipeline, run_client.py, and <100 MiB size."""
+        from src.biometrics.pipeline import BiometricPipeline
+
+        root = Path(__file__).resolve().parent.parent.parent
+        ckpt_path = root / "models" / "convnextv2_tiny_biometrics.pt"
+        yunet_path = root / "models" / "face_detection_yunet_2023mar.onnx"
+        assert ckpt_path.exists()
+        assert yunet_path.exists()
+        assert ckpt_path.stat().st_size < 100 * 1024 * 1024  # Strictly under GitHub 100 MiB limit
+
+        edge = EdgeAsyncPipeline(use_openvino=False)
+        assert edge.backbone_name == "convnextv2_tiny"
+        assert edge.target_size == 224
+        assert edge.aligner.target_size == 224
+
+        bio = BiometricPipeline(checkpoint_path=ckpt_path, enable_quality_audit=False)
+        assert bio.target_size == 224
+        assert bio.aligner.target_size == 224
+        assert bio.estimator_model is not None
+
+        run_client_src = (root / "run_client.py").read_text(encoding="utf-8")
+        assert '"--target-size"' in run_client_src
+        assert "default=224" in run_client_src
+        assert "target_size=args.target_size" in run_client_src
+
 

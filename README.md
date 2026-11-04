@@ -72,9 +72,8 @@ Evaluated in [`reports/training_evaluation_report.json`](reports/training_evalua
 ├── configs/
 │   └── pipeline_config.yaml                  # Dataset curation, 23-interval LDL & quality thresholds
 ├── models/
-│   ├── .gitkeep
-│   ├── convnextv2_tiny_biometrics.pt         # Trained ConvNeXt-V2-Tiny Student checkpoint (224x224)
-│   └── face_detection_yunet_2023mar.onnx     # YuNet 5-point landmark face detector
+│   ├── convnextv2_tiny_biometrics.pt         # Trained ConvNeXt-V2-Tiny Student Soup checkpoint (224x224, 56.27 MiB)
+│   └── face_detection_yunet_2023mar.onnx     # YuNet 5-point landmark face detector (227 KB)
 ├── notebooks/
 │   ├── dataset-metadata.json                 # Kaggle Dataset metadata
 │   ├── kaggle_face_mining_pipeline.ipynb     # 224x224 real-human face mining & filtering kernel
@@ -84,7 +83,7 @@ Evaluated in [`reports/training_evaluation_report.json`](reports/training_evalua
 │       └── kernel-metadata.json              # Training kernel metadata
 ├── reports/
 │   ├── dataset_audit_report.md               # Manifest & cross-split integrity summary
-│   ├── demographic_distribution_report.md    # 8,331-sample demographic & cohort breakdown
+│   ├── demographic_distribution_report.md    # 8,331-sample 23-interval, 10-cohort & 13-source breakdown
 │   ├── kaggle_dataset_audit_20261103.json    # Full forensic audit of 8,331 decoded 224x224 images
 │   ├── metadata.csv                          # Master 8,331-record dataset manifest (CSV)
 │   ├── metadata.parquet                      # Master 8,331-record dataset manifest (Parquet)
@@ -111,7 +110,7 @@ Evaluated in [`reports/training_evaluation_report.json`](reports/training_evalua
 │       ├── curation.py                       # ExtremeDatasetCurator (224x224)
 │       └── intervals.py                      # Canonical 23 fine age interval definitions
 ├── tests/                                    # Unit, integration & adversarial boundary test suites
-├── run_client.py                             # Real-time video / iVCam HUD launcher
+├── run_client.py                             # Real-time video / iVCam HUD launcher (224x224)
 ├── pytest.ini
 └── requirements.txt
 ```
@@ -121,7 +120,7 @@ Evaluated in [`reports/training_evaluation_report.json`](reports/training_evalua
 ## 🛠️ Installation
 
 ```bash
-# Clone the repository
+# Clone the repository (includes trained ConvNeXt-V2-Tiny and YuNet weights in models/)
 git clone https://github.com/thanhmuefatty07/face-detection-gender-age.git
 cd face-detection-gender-age
 
@@ -149,17 +148,32 @@ python -m src.biometrics.cli --webcam 0
 ```
 
 ### 2. Real-Time Multi-Target Locked HUD (`run_client.py`)
-Run the FastAPI inference server locally (or on a Kaggle GPU tunnel) and launch the 60 FPS target-locked HUD:
+Run the FastAPI inference server locally (or on a Kaggle GPU tunnel) and launch the 60 FPS target-locked HUD at $224 \times 224$:
 ```bash
 # Terminal 1: Start local or cloud FastAPI + WebSocket inference server (auto-loads models/convnextv2_tiny_biometrics.pt)
 python scripts/kaggle_pipeline/kaggle_inference_server.py
 
-# Terminal 2: Launch real-time HUD client
-python run_client.py --server ws://localhost:8000/ws/infer --camera 0
+# Terminal 2: Launch real-time HUD client (aligns faces at 224x224)
+python run_client.py --server ws://localhost:8000/ws/infer --camera 0 --target-size 224
 ```
 *Press `[ESC]` on the HUD window to exit.*
 
-### 3. Automated Test Suite
+### 3. Python API (`BiometricPipeline` & `EdgeAsyncPipeline`)
+```python
+import cv2
+from src.biometrics.pipeline import BiometricPipeline
+from src.biometrics.inference.async_pipeline import EdgeAsyncPipeline
+
+# Single-frame / image biometric audit & estimation (auto-sets target_size=224 with checkpoint)
+pipeline = BiometricPipeline(checkpoint_path="models/convnextv2_tiny_biometrics.pt")
+results = pipeline.process_frame(cv2.imread("path/to/photo.jpg"))
+
+# Multi-target video tracking & TargetLocker anti-jitter (auto-loads models/convnextv2_tiny_biometrics.pt @ 224x224)
+edge = EdgeAsyncPipeline()
+locked_targets = edge.process_frame(cv2.imread("path/to/frame.jpg"))
+```
+
+### 4. Automated Test Suite
 Run all unit, integration, pipeline, and adversarial tests across `tests/` and `scripts/tests/`:
 ```bash
 python -m pytest tests scripts/tests -q
