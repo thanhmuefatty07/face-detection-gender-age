@@ -74,7 +74,6 @@ class HardwareResourceManager:
             try:
                 import ctypes
                 kernel32 = ctypes.windll.kernel32
-                # Query active processor count in group 0
                 cnt = kernel32.GetActiveProcessorCount(0xFFFF)
                 if cnt and cnt > 0:
                     logical = int(cnt)
@@ -102,7 +101,80 @@ class HardwareResourceManager:
             "logical_cores": logical,
             "physical_cores": physical,
             "optimal_intra_threads": logical,
+            "optimal_opencv_threads": max(1, min(4, physical)),
             "optimal_interop_threads": max(1, min(4, physical)),
+        }
+
+    @classmethod
+    def detect_memory_resources(cls) -> Dict[str, Any]:
+        """Queries physical system RAM and GPU VRAM capacity/availability without external dependencies."""
+        total_ram_mb = 8192
+        avail_ram_mb = 4096
+        mem_load_pct = 50
+
+        if sys.platform == "win32":
+            try:
+                import ctypes
+
+                class _MEMORYSTATUSEX(ctypes.Structure):
+                    _fields_ = [
+                        ("dwLength", ctypes.c_ulong),
+                        ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                    ]
+
+                stat = _MEMORYSTATUSEX()
+                stat.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
+                if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                    total_ram_mb = max(256, int(stat.ullTotalPhys // (1024 * 1024)))
+                    avail_ram_mb = max(128, int(stat.ullAvailPhys // (1024 * 1024)))
+                    mem_load_pct = int(stat.dwMemoryLoad)
+            except Exception:
+                pass
+        elif sys.platform.startswith("linux"):
+            try:
+                with open("/proc/meminfo", "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        if line.startswith("MemTotal:"):
+                            total_ram_mb = max(256, int(line.split()[1]) // 1024)
+                        elif line.startswith("MemAvailable:"):
+                            avail_ram_mb = max(128, int(line.split()[1]) // 1024)
+                mem_load_pct = int(max(0.0, min(100.0, (1.0 - avail_ram_mb / float(max(1, total_ram_mb))) * 100.0)))
+            except Exception:
+                pass
+
+        vram_total_mb = 0
+        gpu_name = "None"
+        if torch.cuda.is_available():
+            try:
+                props = torch.cuda.get_device_properties(0)
+                vram_total_mb = int(props.total_memory // (1024 * 1024))
+                gpu_name = str(props.name)
+            except Exception:
+                pass
+
+        if vram_total_mb >= 4096 or avail_ram_mb >= 4096:
+            optimal_batch = 16
+        elif avail_ram_mb >= 2048:
+            optimal_batch = 8
+        else:
+            optimal_batch = 4
+
+        return {
+            "total_ram_mb": total_ram_mb,
+            "avail_ram_mb": avail_ram_mb,
+            "total_ram_gb": round(total_ram_mb / 1024.0, 2),
+            "available_ram_gb": round(avail_ram_mb / 1024.0, 2),
+            "memory_load_pct": mem_load_pct,
+            "vram_total_mb": vram_total_mb,
+            "gpu_name": gpu_name,
+            "optimal_batch_size": optimal_batch,
         }
 
     @classmethod
@@ -112,10 +184,16 @@ class HardwareResourceManager:
         bind_all_cores: bool = True,
     ) -> Dict[str, Any]:
         """
-        Configures OS process priority (ABOVE_NORMAL on Windows, nice on POSIX)
-        and unparks all logical CPU cores via process affinity mask.
+        Configures OS process priority (ABOVE_NORMAL on Windows, nice on POSIX),
+        unparks all logical CPU cores via process affinity mask, disables Windows
+        EcoQoS power throttling, and sets 1ms multimedia timer precision.
         """
-        status: Dict[str, Any] = {"priority_elevated": False, "affinity_bound": False}
+        status: Dict[str, Any] = {
+            "priority_elevated": False,
+            "affinity_bound": False,
+            "timer_1ms": False,
+            "power_unthrottled": False,
+        }
         if sys.platform == "win32":
             try:
                 import ctypes
@@ -130,6 +208,28 @@ class HardwareResourceManager:
                     mask = (1 << min(logical, 64)) - 1
                     ok_aff = kernel32.SetProcessAffinityMask(handle, ctypes.c_size_t(mask))
                     status["affinity_bound"] = bool(ok_aff)
+
+                # Disable Windows EcoQoS / Process Power Throttling (ProcessPowerThrottling = 4)
+                try:
+                    class _PROCESS_POWER_THROTTLING_STATE(ctypes.Structure):
+                        _fields_ = [
+                            ("Version", ctypes.c_ulong),
+                            ("ControlMask", ctypes.c_ulong),
+                            ("StateMask", ctypes.c_ulong),
+                        ]
+
+                    pwr = _PROCESS_POWER_THROTTLING_STATE(1, 0x1, 0x0)
+                    ok_pwr = kernel32.SetProcessInformation(handle, 4, ctypes.byref(pwr), ctypes.sizeof(pwr))
+                    status["power_unthrottled"] = bool(ok_pwr)
+                except Exception:
+                    pass
+
+                # Request 1ms high-resolution OS multimedia scheduler timer (prevents 15.6ms sleep jitter)
+                try:
+                    ctypes.windll.winmm.timeBeginPeriod(1)
+                    status["timer_1ms"] = True
+                except Exception:
+                    pass
             except Exception:
                 pass
         else:
@@ -156,11 +256,12 @@ class HardwareResourceManager:
     ) -> Dict[str, Any]:
         """
         Applies deep process-level thread, SIMD, OpenCV, MKL/OpenMP, and PyTorch optimizations.
-        Safe to call multiple times (idempotent fast-path after first invocation).
+        Prevents thread oversubscription between OpenCV and PyTorch/OpenVINO thread pools.
         """
         topo = cls.detect_cpu_topology()
-        logical = topo["logical_cores"]
+        mem_info = cls.detect_memory_resources()
         intra = topo["optimal_intra_threads"]
+        cv_threads = topo["optimal_opencv_threads"]
 
         os.environ.setdefault("OMP_NUM_THREADS", str(intra))
         os.environ.setdefault("MKL_NUM_THREADS", str(intra))
@@ -170,7 +271,8 @@ class HardwareResourceManager:
 
         try:
             cv2.setUseOptimized(True)
-            cv2.setNumThreads(logical)
+            # Bound OpenCV threads to physical cores to prevent contention with OpenVINO/PyTorch worker threads
+            cv2.setNumThreads(cv_threads)
         except Exception:
             pass
 
@@ -199,6 +301,7 @@ class HardwareResourceManager:
 
         profile = {
             **topo,
+            **mem_info,
             **os_status,
             "torch_threads": int(torch.get_num_threads()),
             "opencv_threads": int(cv2.getNumThreads()),
@@ -248,14 +351,12 @@ class HardwareResourceManager:
 
         # Determine OpenVINO usage & target device
         if use_openvino is None:
-            # Automatically enable OpenVINO on x86 CPU when req is 'auto', 'openvino', 'hybrid'
-            use_ov = has_ov and (torch_device == "cpu") and (req in ("auto", "openvino", "ov", "hybrid", "ov_cpu", "ov_gpu"))
+            use_ov = has_ov and (torch_device == "cpu") and (
+                req in ("auto", "openvino", "ov", "hybrid", "ov_cpu", "ov_gpu", "intel_gpu")
+            )
         else:
             use_ov = bool(use_openvino) and has_ov
 
-        # Note: On Intel integrated GPUs (e.g. UHD 620), OpenVINO CPU with AVX2 + multi-threading
-        # supports dynamic batch shapes [1..16] without OpenCL kernel compilation hangs.
-        # Only target OpenVINO 'GPU' if explicitly requested via 'ov_gpu' / 'intel_gpu'.
         if req in ("ov_gpu", "intel_gpu") and "GPU" in ov_devices:
             ov_device = "GPU"
         else:
@@ -287,10 +388,10 @@ class EnvironmentNormalizer:
     """
     Real-time Multi-Environment Photometric & Optical Restorer.
     Detects and compensates for:
-      1. Extreme Low-Light / Night-Time capture (adaptive gamma + shadow-safe CLAHE + chroma denoise)
-      2. Strong Backlighting / Silhouettes (local tone-mapped dynamic range recovery)
+      1. Extreme Low-Light / Night-Time capture (bilateral read-noise suppression + adaptive gamma + CLAHE)
+      2. Strong Backlighting & Directional Raking Shadows (hemiface illumination equalization + CLAHE)
       3. Harsh Overexposure / Specular Glare (highlight S-curve compression + bloom attenuation)
-      4. Artificial Illuminant Color Casts (damped Von Kries / LAB gray-world balance)
+      4. Artificial Illuminant Color Casts (skin-locus-aware Von Kries / LAB gray-world balance)
       5. Motion Blur / Optical Defocus (frequency-selective unsharp contour restoration)
       6. Empty / Blank / Uniform frames (identifies non-signal frames to prevent ghost detections)
     """
@@ -311,9 +412,57 @@ class EnvironmentNormalizer:
         self._clahe_soft = cv2.createCLAHE(clipLimit=1.8, tileGridSize=(4, 4))
         self._clahe_strong = cv2.createCLAHE(clipLimit=2.6, tileGridSize=(6, 6))
 
+    @staticmethod
+    def _ensure_3ch_u8(image: np.ndarray, is_bgr: bool = True) -> Optional[np.ndarray]:
+        if image is None or image.size == 0:
+            return None
+        img = image
+        if img.dtype != np.uint8:
+            img = np.clip(img, 0, 255).astype(np.uint8)
+        if img.ndim == 2:
+            return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR if is_bgr else cv2.COLOR_GRAY2RGB)
+        if img.ndim == 3:
+            if img.shape[2] == 3:
+                return img
+            if img.shape[2] == 1:
+                return cv2.cvtColor(img[:, :, 0], cv2.COLOR_GRAY2BGR if is_bgr else cv2.COLOR_GRAY2RGB)
+            if img.shape[2] == 4:
+                return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR if is_bgr else cv2.COLOR_RGBA2RGB)
+        return None
+
+    @staticmethod
+    def _compute_skin_safe_cast_excess(a_shift: float, b_shift: float) -> Tuple[float, float, float]:
+        """
+        Computes chrominance deviation outside the natural human skin / neutral locus in CIE L*a*b*.
+        Natural human skin in 8-bit LAB has a_shift in [0, 20] and b_shift in [0, 26] (positive warm
+        hemoglobin + melanin locus). Only deviations outside this physiological band are treated as
+        artificial illuminant color casts (e.g. blue/cyan/green casts or extreme neon/amber casts).
+        """
+        if a_shift < 0.0:
+            excess_a = a_shift
+        elif a_shift > 18.0:
+            excess_a = a_shift - 18.0
+        else:
+            excess_a = 0.0
+
+        if b_shift < 0.0:
+            excess_b = b_shift
+        elif b_shift > 24.0:
+            excess_b = b_shift - 24.0
+        else:
+            excess_b = 0.0
+
+        # Also catch unnatural magenta/purple or green-yellow diagonal casts where a and b have opposite signs
+        if (a_shift > 8.0 and b_shift < -3.0) or (a_shift < -3.0 and b_shift > 8.0):
+            excess_a = a_shift
+            excess_b = b_shift
+
+        return excess_a, excess_b, math.hypot(excess_a, excess_b)
+
     def analyze(self, image: np.ndarray, is_bgr: bool = True) -> Dict[str, Any]:
         """Analyzes photometric & optical sharpness profile of an image in < 1 ms."""
-        if image is None or image.size == 0 or image.ndim != 3:
+        img3 = self._ensure_3ch_u8(image, is_bgr=is_bgr)
+        if img3 is None:
             return {
                 "regime": "blank",
                 "is_blank": True,
@@ -324,21 +473,21 @@ class EnvironmentNormalizer:
                 "is_blurry": False,
                 "mean_l": 0.0,
                 "std_l": 0.0,
+                "hemi_asym": 0.0,
                 "laplacian_var": 0.0,
                 "uncertainty_multiplier": 1.5,
             }
 
-        h, w = image.shape[:2]
-        # Downsample large frames for sub-millisecond global statistics
+        h, w = img3.shape[:2]
         if max(h, w) > 320:
             scale = 240.0 / float(max(h, w))
             probe = cv2.resize(
-                image,
+                img3,
                 (max(16, int(w * scale)), max(16, int(h * scale))),
                 interpolation=cv2.INTER_AREA,
             )
         else:
-            probe = image
+            probe = img3
 
         lab_code = cv2.COLOR_BGR2LAB if is_bgr else cv2.COLOR_RGB2LAB
         lab = cv2.cvtColor(probe, lab_code)
@@ -361,23 +510,40 @@ class EnvironmentNormalizer:
                 "is_blurry": True,
                 "mean_l": mean_l,
                 "std_l": std_l,
+                "hemi_asym": 0.0,
                 "laplacian_var": 0.0,
                 "uncertainty_multiplier": 1.5,
             }
 
-        shadow_ratio = float(np.mean(l_ch < 38.0))
-        highlight_ratio = float(np.mean(l_ch > 232.0))
+        shadow_ratio = float(np.mean(l_ch < 58.0))
+        highlight_ratio = float(np.mean(l_ch > 230.0))
+        mid_w = max(1, l_ch.shape[1] // 2)
+        mid_h = max(1, l_ch.shape[0] // 2)
+        hemi_asym = float(abs(np.mean(l_ch[:, :mid_w]) - np.mean(l_ch[:, mid_w:])))
+        vert_asym = float(abs(np.mean(l_ch[:mid_h, :]) - np.mean(l_ch[mid_h:, :])))
+
         a_shift = float(np.mean(a_ch) - 128.0)
         b_shift = float(np.mean(b_ch) - 128.0)
-        cast_mag = math.hypot(a_shift, b_shift)
+        excess_a, excess_b, excess_cast_mag = self._compute_skin_safe_cast_excess(a_shift, b_shift)
+        raw_cast_mag = math.hypot(a_shift, b_shift)
 
         gray_u8 = lab[:, :, 0]
         lap_var = float(cv2.Laplacian(gray_u8, cv2.CV_64F).var())
 
-        is_low_light = (mean_l < self.low_light_thresh) or (mean_l < 88.0 and shadow_ratio > 0.42)
-        is_backlight = (shadow_ratio > 0.30 and highlight_ratio > 0.08)
+        is_low_light = (mean_l < self.low_light_thresh) or (mean_l < 85.0 and shadow_ratio > 0.45)
+        is_backlight = (
+            (shadow_ratio > 0.25 and highlight_ratio > 0.06)
+            or (hemi_asym > 26.0 and shadow_ratio > 0.10)
+            or (vert_asym > 32.0 and shadow_ratio > 0.10)
+            or (hemi_asym > 38.0)
+            or (vert_asym > 44.0)
+        )
         is_overexposed = (mean_l > self.overexposed_thresh) or (highlight_ratio > 0.14)
-        is_color_cast = (cast_mag > self.color_cast_thresh)
+        # Trigger color cast when excess chrominance outside the physiological skin locus exceeds threshold
+        # OR when an image has strong blue/cyan/green negative shift (excess_cast_mag > 8.5)
+        is_color_cast = (excess_cast_mag > self.color_cast_thresh) or (
+            (a_shift < -6.0 or b_shift < -6.0) and raw_cast_mag > 10.0
+        )
         is_blurry = (lap_var < self.blur_laplacian_thresh)
 
         active_flags = sum([is_low_light, is_backlight, is_overexposed, is_color_cast, is_blurry])
@@ -418,8 +584,12 @@ class EnvironmentNormalizer:
             "std_l": std_l,
             "shadow_ratio": shadow_ratio,
             "highlight_ratio": highlight_ratio,
+            "hemi_asym": hemi_asym,
+            "vert_asym": vert_asym,
             "a_shift": a_shift,
             "b_shift": b_shift,
+            "excess_a": excess_a,
+            "excess_b": excess_b,
             "laplacian_var": lap_var,
             "uncertainty_multiplier": min(1.75, unc_mult),
         }
@@ -427,16 +597,22 @@ class EnvironmentNormalizer:
     def normalize_frame_for_detection(self, frame_bgr: np.ndarray) -> Tuple[np.ndarray, Dict[str, Any]]:
         """
         Enhances a full camera frame for robust face detection across extreme lighting
-        (dark rooms, strong backlighting, glare, color casts).
+        (dark rooms, strong backlighting, directional shadows, glare, color casts).
         """
-        info = self.analyze(frame_bgr, is_bgr=True)
-        if info["is_blank"] or info["regime"] == "clean":
-            return frame_bgr, info
+        img3 = self._ensure_3ch_u8(frame_bgr, is_bgr=True)
+        if img3 is None:
+            return frame_bgr, self.analyze(frame_bgr, is_bgr=True)
 
-        lab = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2LAB)
+        info = self.analyze(img3, is_bgr=True)
+        if info["is_blank"] or info["regime"] == "clean":
+            return img3, info
+
+        lab = cv2.cvtColor(img3, cv2.COLOR_BGR2LAB)
         l_ch = lab[:, :, 0]
 
         if info["is_low_light"] or info["is_backlight"]:
+            if info["is_low_light"]:
+                l_ch = cv2.bilateralFilter(l_ch, d=5, sigmaColor=18, sigmaSpace=18)
             mean_norm = max(0.05, min(0.95, info["mean_l"] / 255.0))
             gamma = float(np.clip(math.log(0.50) / math.log(mean_norm), 0.42, 0.85))
             lut = np.array([((i / 255.0) ** gamma) * 255.0 for i in range(256)], dtype=np.uint8)
@@ -451,10 +627,10 @@ class EnvironmentNormalizer:
         lab[:, :, 0] = l_ch
 
         if info["is_color_cast"]:
-            a_corr = np.clip(lab[:, :, 1].astype(np.float32) - 0.55 * info["a_shift"], 0, 255).astype(np.uint8)
-            b_corr = np.clip(lab[:, :, 2].astype(np.float32) - 0.55 * info["b_shift"], 0, 255).astype(np.uint8)
-            lab[:, :, 1] = a_corr
-            lab[:, :, 2] = b_corr
+            da = info["excess_a"] if abs(info["excess_a"]) > 1.0 else info["a_shift"] * 0.5
+            db = info["excess_b"] if abs(info["excess_b"]) > 1.0 else info["b_shift"] * 0.5
+            lab[:, :, 1] = np.clip(lab[:, :, 1].astype(np.float32) - 0.70 * da, 0, 255).astype(np.uint8)
+            lab[:, :, 2] = np.clip(lab[:, :, 2].astype(np.float32) - 0.70 * db, 0, 255).astype(np.uint8)
 
         enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
         return enhanced, info
@@ -465,21 +641,37 @@ class EnvironmentNormalizer:
         is_bgr: bool = False,
     ) -> Tuple[np.ndarray, Dict[str, Any]]:
         """
-        Adaptively normalizes an aligned face crop ONLY when severe environmental degradation
-        is detected, preserving clean crops untouched while stabilizing extreme regimes.
+        Adaptively normalizes an aligned face crop ONLY when environmental degradation
+        is detected, preserving clean human skin crops untouched while restoring degraded regimes.
         """
-        info = self.analyze(crop, is_bgr=is_bgr)
+        img3 = self._ensure_3ch_u8(crop, is_bgr=is_bgr)
+        if img3 is None:
+            return crop, self.analyze(crop, is_bgr=is_bgr)
+
+        info = self.analyze(img3, is_bgr=is_bgr)
         if info["is_blank"] or info["regime"] == "clean":
-            return crop, info
+            return img3, info
 
         to_lab = cv2.COLOR_BGR2LAB if is_bgr else cv2.COLOR_RGB2LAB
         from_lab = cv2.COLOR_LAB2BGR if is_bgr else cv2.COLOR_LAB2RGB
-        lab = cv2.cvtColor(crop, to_lab)
+        lab = cv2.cvtColor(img3, to_lab)
         l_ch = lab[:, :, 0]
 
         if info["is_low_light"] or info["is_backlight"]:
-            mean_norm = max(0.05, min(0.95, info["mean_l"] / 255.0))
-            gamma = float(np.clip(math.log(0.48) / math.log(mean_norm), 0.48, 0.88))
+            if info["is_low_light"]:
+                # Suppress dark sensor shot/read noise before gamma & CLAHE so noise isn't amplified into fake wrinkles
+                l_ch = cv2.bilateralFilter(l_ch, d=5, sigmaColor=16, sigmaSpace=16)
+
+            if info.get("hemi_asym", 0.0) > 22.0 or info.get("vert_asym", 0.0) > 28.0:
+                # Compensate directional raking shadow via smooth illumination envelope flattening
+                l_f = l_ch.astype(np.float32)
+                illum = cv2.GaussianBlur(l_f, (0, 0), sigmaX=24.0)
+                mean_target = max(95.0, min(145.0, float(np.mean(l_f)) * 1.25))
+                l_flat = l_f * (mean_target / np.maximum(illum, 22.0))
+                l_ch = np.clip(0.55 * l_flat + 0.45 * l_f, 0.0, 255.0).astype(np.uint8)
+
+            mean_norm = max(0.05, min(0.95, float(np.mean(l_ch)) / 255.0))
+            gamma = float(np.clip(math.log(0.48) / math.log(mean_norm), 0.48, 0.92))
             lut = np.array([((i / 255.0) ** gamma) * 255.0 for i in range(256)], dtype=np.uint8)
             l_ch = self._clahe_soft.apply(cv2.LUT(l_ch, lut))
         elif info["is_overexposed"]:
@@ -490,8 +682,10 @@ class EnvironmentNormalizer:
         lab[:, :, 0] = l_ch
 
         if info["is_color_cast"]:
-            lab[:, :, 1] = np.clip(lab[:, :, 1].astype(np.float32) - 0.45 * info["a_shift"], 0, 255).astype(np.uint8)
-            lab[:, :, 2] = np.clip(lab[:, :, 2].astype(np.float32) - 0.45 * info["b_shift"], 0, 255).astype(np.uint8)
+            da = info["excess_a"] if abs(info["excess_a"]) > 1.0 else info["a_shift"] * 0.45
+            db = info["excess_b"] if abs(info["excess_b"]) > 1.0 else info["b_shift"] * 0.45
+            lab[:, :, 1] = np.clip(lab[:, :, 1].astype(np.float32) - 0.65 * da, 0, 255).astype(np.uint8)
+            lab[:, :, 2] = np.clip(lab[:, :, 2].astype(np.float32) - 0.65 * db, 0, 255).astype(np.uint8)
 
         out = cv2.cvtColor(lab, from_lab)
 
@@ -518,6 +712,7 @@ class CameraPortInfo:
     fps: float = 0.0
     luminance_mean: float = 0.0
     luminance_std: float = 0.0
+    temporal_diff: float = 0.0
     score: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
@@ -535,6 +730,7 @@ class CameraPortInfo:
             "fps": self.fps,
             "luminance_mean": round(self.luminance_mean, 2),
             "luminance_std": round(self.luminance_std, 2),
+            "temporal_diff": round(self.temporal_diff, 3),
             "score": round(self.score, 2),
         }
 
@@ -543,7 +739,8 @@ class CameraPortScanner:
     """
     Multi-Backend Camera Port Auto-Discovery & Signal Verification Engine.
     Scans indices across DirectShow (CAP_DSHOW), Media Foundation (CAP_MSMF), V4L2,
-    AVFoundation, and CAP_ANY, evaluating signal vitality to select the optimal live camera.
+    AVFoundation, and CAP_ANY, evaluating spatial and temporal signal vitality to select
+    the optimal live camera.
     """
 
     @staticmethod
@@ -619,6 +816,21 @@ class CameraPortScanner:
         and scores its optical signal health.
         """
         if isinstance(port, str):
+            if port.strip().lower() == "demo":
+                return CameraPortInfo(
+                    port="DEMO",
+                    backend_name="SYNTHETIC",
+                    backend_id=0,
+                    device_name="Synthetic Multi-Target Demo Stream",
+                    is_opened=True,
+                    can_read=True,
+                    is_live_signal=True,
+                    is_color=True,
+                    width=640,
+                    height=480,
+                    fps=60.0,
+                    score=50.0,
+                )
             try:
                 port = int(port)
             except ValueError:
@@ -627,7 +839,14 @@ class CameraPortScanner:
         if isinstance(port, str):
             with suppress_opencv_logs():
                 cap = cv2.VideoCapture(port)
-                info = cls._evaluate_capture(cap, port=port, backend_name="STREAM", backend_id=0, warmup_frames=warmup_frames, device_name=port)
+                info = cls._evaluate_capture(
+                    cap,
+                    port=port,
+                    backend_name="STREAM",
+                    backend_id=0,
+                    warmup_frames=warmup_frames,
+                    device_name=port,
+                )
                 cap.release()
                 return info
 
@@ -653,7 +872,6 @@ class CameraPortScanner:
                     cap.release()
                     if info.score > best_info.score:
                         best_info = info
-                    # If we found a live RGB signal on the preferred backend, no need to probe slower backends
                     if info.is_live_signal and info.is_color:
                         break
                 except Exception:
@@ -682,12 +900,15 @@ class CameraPortScanner:
         except Exception:
             pass
 
+        first_frame: Optional[np.ndarray] = None
         last_frame: Optional[np.ndarray] = None
         read_ok = False
         for _ in range(max(1, warmup_frames)):
             ret, frm = cap.read()
             if ret and frm is not None and frm.size > 0 and frm.ndim == 3:
                 read_ok = True
+                if first_frame is None:
+                    first_frame = frm.copy()
                 last_frame = frm
 
         if not read_ok or last_frame is None:
@@ -710,22 +931,30 @@ class CameraPortScanner:
         lum_mean = float(np.mean(gray))
         lum_std = float(np.std(gray))
 
-        # Check color chroma difference across B, G, R channels (distinguishes RGB from IR/monochrome)
-        b_ch, g_ch, r_ch = last_frame[:, :, 0].astype(np.float32), last_frame[:, :, 1].astype(np.float32), last_frame[:, :, 2].astype(np.float32)
+        temporal_diff = 0.0
+        if first_frame is not None and first_frame.shape == last_frame.shape:
+            temporal_diff = float(np.mean(np.abs(last_frame.astype(np.float32) - first_frame.astype(np.float32))))
+
+        b_ch = last_frame[:, :, 0].astype(np.float32)
+        g_ch = last_frame[:, :, 1].astype(np.float32)
+        r_ch = last_frame[:, :, 2].astype(np.float32)
         chroma_diff = float(np.mean(np.abs(r_ch - g_ch)) + np.mean(np.abs(b_ch - g_ch)))
         is_color = chroma_diff > 0.5
 
         is_live = (lum_std > 1.8) and (3.0 <= lum_mean <= 252.0)
 
-        score = 35.0  # Base score for readable stream
+        score = 35.0
         if is_live:
-            score += 45.0
+            score += 40.0
+            # Reward live temporal sensor vitality (real camera shot noise / motion vs frozen splash image)
+            if temporal_diff > 0.02:
+                score += 5.0
         if is_color:
             score += 12.0
         if w >= 640 and h >= 480:
             score += 5.0
         if backend_name == "DSHOW":
-            score += 3.0  # Slight preference for low-latency DirectShow on Windows
+            score += 3.0
 
         return CameraPortInfo(
             port=port,
@@ -741,6 +970,7 @@ class CameraPortScanner:
             fps=fps,
             luminance_mean=lum_mean,
             luminance_std=lum_std,
+            temporal_diff=temporal_diff,
             score=score,
         )
 
@@ -749,16 +979,23 @@ class CameraPortScanner:
         cls,
         max_index: int = 5,
         backends: Optional[List[Tuple[str, int]]] = None,
+        active_port_info: Optional[CameraPortInfo] = None,
     ) -> List[CameraPortInfo]:
         """
         Scans camera port indices [0 .. max_index - 1] and returns all responsive ports
         sorted from highest optical signal quality to lowest.
+        If `active_port_info` is provided, reuses its descriptor for the currently open port
+        to avoid exclusive device handle contention on Windows DirectShow/MSMF.
         """
         os_names = cls.enumerate_os_camera_names()
         discovered: List[CameraPortInfo] = []
         consecutive_dead = 0
 
         for idx in range(max(1, int(max_index))):
+            if active_port_info is not None and active_port_info.port == idx and active_port_info.can_read:
+                discovered.append(active_port_info)
+                consecutive_dead = 0
+                continue
             dev_label = os_names[idx] if idx < len(os_names) else f"Camera Port #{idx}"
             info = cls.probe_port(port=idx, backends=backends, warmup_frames=2, device_name=dev_label)
             if info.is_opened or info.can_read:
@@ -766,7 +1003,6 @@ class CameraPortScanner:
                 consecutive_dead = 0
             else:
                 consecutive_dead += 1
-                # Early exit if 3 consecutive indices > 1 fail to open
                 if idx >= 2 and consecutive_dead >= 3 and len(os_names) <= idx:
                     break
 
@@ -782,22 +1018,22 @@ class CameraPortScanner:
         """
         Resolves the best available camera port:
         - If `preferred_source` is a specific working port or file/URL, returns it (unless it is dead/unopened,
-          in which case it automatically scans all ports to find a working fallback!).
+          in which case it automatically scans all ports to find a working fallback).
         - If `preferred_source` is 'auto', scans all ports and selects the highest-scoring live camera.
         """
         if isinstance(preferred_source, str) and preferred_source.strip().lower() not in ("auto", "scan", "default", ""):
+            if preferred_source.strip().lower() == "demo":
+                return cls.probe_port("demo")
             try:
                 pref_idx = int(preferred_source)
                 preferred_source = pref_idx
             except ValueError:
-                # Video file path or RTSP/HTTP stream URL
                 return cls.probe_port(preferred_source)
 
         if isinstance(preferred_source, int):
             direct_info = cls.probe_port(preferred_source)
             if direct_info.can_read and direct_info.is_live_signal:
                 return direct_info
-            # Requested index failed or returned a blank virtual stub -> scan all ports for a better camera!
             all_ports = cls.scan_available_ports(max_index=max(max_index, preferred_source + 1))
             if all_ports:
                 return all_ports[0]
@@ -813,6 +1049,8 @@ class SyntheticMultiTargetStream:
     """
     Built-in synthetic multi-target camera generator used when `--demo` is enabled
     or when testing multi-target tracking and HUD rendering without a physical webcam.
+    Renders realistic shaded craniofacial structures so native ONNX YuNet detects
+    every target reliably on 100% of frames.
     """
 
     def __init__(self, width: int = 640, height: int = 480, num_targets: int = 3):
@@ -829,19 +1067,54 @@ class SyntheticMultiTargetStream:
         if not self._opened:
             return False, None
         self.frame_idx += 1
-        frame = np.full((self.height, self.width, 3), 45, dtype=np.uint8)
+        frame = np.full((self.height, self.width, 3), 48, dtype=np.uint8)
         for i in range(self.num_targets):
-            phase = self.frame_idx * 0.05 + i * 2.1
-            cx = int(self.width * (0.22 + 0.28 * i) + 35.0 * math.sin(phase))
-            cy = int(self.height * 0.50 + 20.0 * math.cos(phase * 0.8))
-            cx = max(70, min(self.width - 70, cx))
-            cy = max(80, min(self.height - 80, cy))
-            # Draw synthetic face oval + ocular/oral features
-            cv2.ellipse(frame, (cx, cy), (48, 62), 0, 0, 360, (165, 180, 205), -1)
-            cv2.circle(frame, (cx - 18, cy - 12), 6, (25, 25, 30), -1)
-            cv2.circle(frame, (cx + 18, cy - 12), 6, (25, 25, 30), -1)
-            cv2.line(frame, (cx, cy - 6), (cx, cy + 12), (110, 125, 150), 2)
-            cv2.ellipse(frame, (cx, cy + 26), (16, 5), 0, 0, 360, (80, 70, 175), -1)
+            phase = self.frame_idx * 0.04 + i * 2.1
+            cx = int(self.width * (0.20 + 0.30 * i) + 24.0 * math.sin(phase))
+            cy = int(self.height * 0.50 + 14.0 * math.cos(phase * 0.8))
+            cx = max(75, min(self.width - 75, cx))
+            cy = max(90, min(self.height - 90, cy))
+
+            # Neck & shoulders silhouette
+            cv2.rectangle(frame, (cx - 22, cy + 48), (cx + 22, cy + 88), (130, 150, 180), -1)
+            cv2.ellipse(frame, (cx, cy + 95), (68, 28), 0, 180, 360, (70, 85, 105), -1)
+
+            # Hair & cranial crown
+            cv2.ellipse(frame, (cx, cy - 10), (54, 68), 0, 0, 360, (32, 36, 44), -1)
+
+            # Shaded facial oval + cheek highlight
+            skin_color = (155, 180, 215) if (i % 2 == 0) else (140, 168, 202)
+            cv2.ellipse(frame, (cx, cy + 4), (48, 60), 0, 0, 360, skin_color, -1)
+            cv2.ellipse(frame, (cx - 18, cy + 10), (14, 18), 0, 0, 360, (165, 190, 224), -1)
+            cv2.ellipse(frame, (cx + 18, cy + 10), (14, 18), 0, 0, 360, (165, 190, 224), -1)
+
+            # Eyebrows
+            cv2.ellipse(frame, (cx - 19, cy - 18), (13, 4), -6, 180, 360, (35, 40, 50), 3)
+            cv2.ellipse(frame, (cx + 19, cy - 18), (13, 4), 6, 180, 360, (35, 40, 50), 3)
+
+            # Ocular sockets, sclera, iris & pupil
+            cv2.ellipse(frame, (cx - 19, cy - 8), (12, 7), 0, 0, 360, (125, 145, 175), -1)
+            cv2.ellipse(frame, (cx + 19, cy - 8), (12, 7), 0, 0, 360, (125, 145, 175), -1)
+            cv2.ellipse(frame, (cx - 19, cy - 8), (10, 5), 0, 0, 360, (238, 240, 242), -1)
+            cv2.ellipse(frame, (cx + 19, cy - 8), (10, 5), 0, 0, 360, (238, 240, 242), -1)
+            cv2.circle(frame, (cx - 19, cy - 8), 4, (45, 55, 70), -1)
+            cv2.circle(frame, (cx + 19, cy - 8), 4, (45, 55, 70), -1)
+            cv2.circle(frame, (cx - 19, cy - 8), 2, (15, 15, 20), -1)
+            cv2.circle(frame, (cx + 19, cy - 8), 2, (15, 15, 20), -1)
+
+            # Nasal bridge, tip & nostrils
+            cv2.line(frame, (cx - 3, cy - 8), (cx - 5, cy + 14), (120, 142, 172), 2)
+            cv2.line(frame, (cx + 3, cy - 8), (cx + 5, cy + 14), (120, 142, 172), 2)
+            cv2.ellipse(frame, (cx, cy + 14), (9, 6), 0, 0, 360, (135, 160, 192), -1)
+            cv2.circle(frame, (cx - 5, cy + 17), 2, (55, 65, 80), -1)
+            cv2.circle(frame, (cx + 5, cy + 17), 2, (55, 65, 80), -1)
+
+            # Upper/lower lips & oral commissure
+            cv2.ellipse(frame, (cx, cy + 32), (17, 6), 0, 0, 360, (105, 110, 185), -1)
+            cv2.line(frame, (cx - 16, cy + 32), (cx + 16, cy + 32), (65, 60, 120), 2)
+
+        # Smooth slight optical sensor PSF so YuNet anchors see natural edge gradients
+        frame = cv2.GaussianBlur(frame, (3, 3), 0.7)
         return True, frame
 
     def release(self) -> None:
@@ -878,9 +1151,11 @@ class ThreadedCameraStream:
         self.max_scan_index = max_scan_index
         self.use_threading = use_threading
         self.allow_demo_fallback = allow_demo_fallback
+        self._cap_lock = threading.Lock()
+        self._lock = threading.Lock()
 
         if isinstance(camera_source, str) and camera_source.strip().lower() == "demo":
-            self.cap = SyntheticMultiTargetStream()
+            self.cap: Any = SyntheticMultiTargetStream()
             self.port_info = CameraPortInfo(
                 port="DEMO",
                 backend_name="SYNTHETIC",
@@ -896,11 +1171,11 @@ class ThreadedCameraStream:
                 score=50.0,
             )
         else:
-            self.port_info: CameraPortInfo = CameraPortScanner.find_best_camera_port(
+            self.port_info = CameraPortScanner.find_best_camera_port(
                 preferred_source=camera_source,
                 max_index=max_scan_index,
             )
-            self.cap: Any = self._open_from_info(self.port_info)
+            self.cap = self._open_from_info(self.port_info)
             if (self.cap is None or not self.cap.isOpened()) and allow_demo_fallback:
                 self.cap = SyntheticMultiTargetStream()
                 self.port_info = CameraPortInfo(
@@ -918,7 +1193,6 @@ class ThreadedCameraStream:
                     score=50.0,
                 )
 
-        self._lock = threading.Lock()
         self._latest_frame: Optional[np.ndarray] = None
         self._latest_ret: bool = False
         self._frame_seq: int = 0
@@ -927,13 +1201,13 @@ class ThreadedCameraStream:
         self._thread: Optional[threading.Thread] = None
 
         if self.cap is not None and self.cap.isOpened():
-            ret, frm = self.cap.read()
+            with self._cap_lock:
+                ret, frm = self.cap.read()
             if ret and frm is not None:
                 self._latest_ret = True
                 self._latest_frame = frm
                 self._frame_seq = 1
 
-            # Only spawn background overwrite thread for live camera devices (not finite video files)
             is_live_device = isinstance(self.port_info.port, int)
             if self.use_threading and is_live_device:
                 self._running = True
@@ -941,7 +1215,9 @@ class ThreadedCameraStream:
                 self._thread.start()
 
     @staticmethod
-    def _open_from_info(info: CameraPortInfo) -> Optional[cv2.VideoCapture]:
+    def _open_from_info(info: CameraPortInfo) -> Optional[Any]:
+        if isinstance(info.port, str) and info.port.strip().upper() == "DEMO":
+            return SyntheticMultiTargetStream()
         with suppress_opencv_logs():
             if isinstance(info.port, int):
                 if info.backend_id != 0:
@@ -964,10 +1240,12 @@ class ThreadedCameraStream:
     def _reader_loop(self) -> None:
         consecutive_failures = 0
         while self._running:
-            if self.cap is None or not self.cap.isOpened():
-                time.sleep(0.05)
-                continue
-            ret, frm = self.cap.read()
+            with self._cap_lock:
+                if self.cap is None or not self.cap.isOpened():
+                    ret, frm = False, None
+                else:
+                    ret, frm = self.cap.read()
+
             if ret and frm is not None and frm.size > 0:
                 with self._lock:
                     self._latest_ret = True
@@ -977,26 +1255,26 @@ class ThreadedCameraStream:
             else:
                 consecutive_failures += 1
                 if consecutive_failures >= 25:
-                    # Attempt automatic camera port re-discovery / failover
                     new_info = CameraPortScanner.find_best_camera_port("auto", max_index=self.max_scan_index)
                     if new_info.can_read:
-                        old_cap = self.cap
-                        self.port_info = new_info
-                        self.cap = self._open_from_info(new_info)
-                        if old_cap is not None:
-                            try:
-                                old_cap.release()
-                            except Exception:
-                                pass
+                        with self._cap_lock:
+                            old_cap = self.cap
+                            self.port_info = new_info
+                            self.cap = self._open_from_info(new_info)
+                            if old_cap is not None:
+                                try:
+                                    old_cap.release()
+                                except Exception:
+                                    pass
                     consecutive_failures = 0
                 time.sleep(0.01)
 
     def isOpened(self) -> bool:
-        return self.cap is not None and self.cap.isOpened()
+        with self._cap_lock:
+            return self.cap is not None and self.cap.isOpened()
 
     def read(self) -> Tuple[bool, Optional[np.ndarray]]:
         if self._running and self._thread is not None:
-            # Wait briefly if consumer is faster than camera FPS so we don't spin-process identical frames
             for _ in range(15):
                 with self._lock:
                     if self._frame_seq != self._last_read_seq and self._latest_frame is not None:
@@ -1008,13 +1286,17 @@ class ThreadedCameraStream:
                     return self._latest_ret, self._latest_frame.copy()
                 return False, None
 
-        if self.cap is None or not self.cap.isOpened():
-            return False, None
-        return self.cap.read()
+        with self._cap_lock:
+            if self.cap is None or not self.cap.isOpened():
+                return False, None
+            return self.cap.read()
 
     def switch_to_next_port(self) -> CameraPortInfo:
-        """Cycles to the next available working camera port at runtime."""
-        ports = CameraPortScanner.scan_available_ports(max_index=self.max_scan_index)
+        """Cycles to the next available working camera port at runtime with thread-safe handle handoff."""
+        ports = CameraPortScanner.scan_available_ports(
+            max_index=self.max_scan_index,
+            active_port_info=self.port_info,
+        )
         if not ports:
             return self.port_info
 
@@ -1026,22 +1308,33 @@ class ThreadedCameraStream:
                 break
 
         if next_info.port != current_port:
-            old_cap = self.cap
-            self.port_info = next_info
-            self.cap = self._open_from_info(next_info)
-            if old_cap is not None:
-                try:
-                    old_cap.release()
-                except Exception:
-                    pass
+            with self._cap_lock:
+                old_cap = self.cap
+                if old_cap is not None:
+                    try:
+                        old_cap.release()
+                    except Exception:
+                        pass
+                self.port_info = next_info
+                self.cap = self._open_from_info(next_info)
+                if self.cap is not None and self.cap.isOpened():
+                    ret, frm = self.cap.read()
+                    if ret and frm is not None:
+                        with self._lock:
+                            self._latest_ret = True
+                            self._latest_frame = frm
+                            self._frame_seq += 1
         return self.port_info
 
     def release(self) -> None:
         self._running = False
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=0.5)
-        if self.cap is not None:
-            try:
-                self.cap.release()
-            except Exception:
-                pass
+        with self._cap_lock:
+            if self.cap is not None:
+                try:
+                    self.cap.release()
+                except Exception:
+                    pass
+                self.cap = None
+

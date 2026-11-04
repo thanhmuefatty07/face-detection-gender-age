@@ -161,53 +161,68 @@ class YuNetFaceDetector(FaceDetectorBase):
         if h < 20 or w < 20:
             return []
 
+        image_bgr = self.env_normalizer._ensure_3ch_u8(image)
+
         # When native OpenCV YuNet ONNX model is loaded:
         if self.detector is not None:
-            # 1. Primary pass at bounded resolution for high speed & multi-face coverage
+            # 1. Bound primary resolution for high speed & multi-face coverage
             if max(h, w) > self.max_detect_dim:
                 scale = float(self.max_detect_dim) / float(max(h, w))
                 work_img = cv2.resize(
-                    image,
+                    image_bgr,
                     (max(32, int(round(w * scale))), max(32, int(round(h * scale)))),
                     interpolation=cv2.INTER_AREA,
                 )
             else:
-                work_img = image
+                work_img = image_bgr
 
-            results = self._run_yunet_pass(work_img, orig_w=w, orig_h=h, conf_thresh=self.confidence_threshold)
+            env_info = self.env_normalizer.analyze(work_img, is_bgr=True)
+            if env_info["is_blank"]:
+                return []
 
-            # 2. If no faces found on a large frame, check if frame is blank; if not blank, try
-            #    (a) close-up downscaled pyramid pass (for faces > 256px close to camera)
-            #    (b) environmental photometric restoration pass (for low-light / backlight / glare)
-            if not results:
-                env_info = self.env_normalizer.analyze(work_img, is_bgr=True)
-                if env_info["is_blank"]:
-                    return []
+            results = self._run_yunet_pass(
+                work_img,
+                orig_w=w,
+                orig_h=h,
+                conf_thresh=self.confidence_threshold,
+            )
 
-                # 2a. Close-up pyramid pass at 320px scale
-                if max(h, w) > 360:
-                    scale_small = 320.0 / float(max(h, w))
-                    small_img = cv2.resize(
-                        image,
-                        (max(32, int(round(w * scale_small))), max(32, int(round(h * scale_small)))),
-                        interpolation=cv2.INTER_AREA,
-                    )
-                    results = self._run_yunet_pass(
-                        small_img,
-                        orig_w=w,
-                        orig_h=h,
-                        conf_thresh=max(0.45, self.confidence_threshold * 0.9),
-                    )
+            # 2. Close-up pyramid pass at 320px scale: catches large foreground faces (>250px)
+            #    even when smaller background faces were already detected in the primary pass.
+            if max(h, w) > 360:
+                scale_small = 320.0 / float(max(h, w))
+                small_img = cv2.resize(
+                    image_bgr,
+                    (max(32, int(round(w * scale_small))), max(32, int(round(h * scale_small)))),
+                    interpolation=cv2.INTER_AREA,
+                )
+                small_dets = self._run_yunet_pass(
+                    small_img,
+                    orig_w=w,
+                    orig_h=h,
+                    conf_thresh=max(0.45, self.confidence_threshold * 0.9),
+                )
+                if small_dets:
+                    results.extend(small_dets)
 
-                # 2b. Multi-environment photometric enhancement pass (dark/backlit/glare/color-cast)
-                if not results and self.enable_env_enhancement and env_info["regime"] != "clean":
-                    enhanced_img, _ = self.env_normalizer.normalize_frame_for_detection(work_img)
-                    results = self._run_yunet_pass(
-                        enhanced_img,
-                        orig_w=w,
-                        orig_h=h,
-                        conf_thresh=max(0.42, self.confidence_threshold * 0.85),
-                    )
+            # 3. Multi-environment photometric enhancement pass (dark/backlit/glare/color-cast):
+            #    Recovers shadowed or backlit faces even if a bright foreground face was already found.
+            has_lighting_stress = bool(
+                env_info["is_low_light"]
+                or env_info["is_backlight"]
+                or env_info["is_overexposed"]
+                or env_info["is_color_cast"]
+            )
+            if self.enable_env_enhancement and (has_lighting_stress or (not results and env_info["regime"] != "clean")):
+                enhanced_img, _ = self.env_normalizer.normalize_frame_for_detection(work_img)
+                env_dets = self._run_yunet_pass(
+                    enhanced_img,
+                    orig_w=w,
+                    orig_h=h,
+                    conf_thresh=max(0.42, self.confidence_threshold * 0.85),
+                )
+                if env_dets:
+                    results.extend(env_dets)
 
             if results:
                 return self._nms_and_rank(results)
@@ -215,13 +230,13 @@ class YuNetFaceDetector(FaceDetectorBase):
             # For small pre-cropped synthetic test images (e.g., 160x160 or 224x224 in unit tests)
             # that are non-blank, allow morphological landmark locator fallback
             if max(h, w) <= 256:
-                gray_check = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+                gray_check = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
                 if float(np.std(gray_check)) >= 5.0:
-                    return self._morphological_fallback_detect(image)
+                    return self._morphological_fallback_detect(image_bgr)
             return []
 
         # Standalone Zero-Dependency Mode (when model_path is None in unit tests)
-        return self._morphological_fallback_detect(image)
+        return self._morphological_fallback_detect(image_bgr)
 
     def _morphological_fallback_detect(self, image: np.ndarray) -> List[FaceDetection]:
         """

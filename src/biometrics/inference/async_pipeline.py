@@ -11,6 +11,7 @@ Integrates:
 
 from __future__ import annotations
 from pathlib import Path
+import threading
 from typing import List, Dict, Any, Optional, Tuple
 import cv2
 import numpy as np
@@ -40,19 +41,20 @@ class EdgeAsyncPipeline:
         self,
         backbone_name: str = "convnextv2_tiny",
         max_targets: int = 16,
-        use_openvino: bool = False,
+        use_openvino: Optional[bool] = None,
         device: str = "cpu",
         yunet_model_path: Optional[str | Path] = None,
         enable_flip_tta: bool = True,
         checkpoint_path: Optional[str | Path] = None,
         target_size: Optional[int] = None,
         enable_env_normalization: bool = True,
-        max_batch_size: int = 16,
+        max_batch_size: Optional[int] = None,
     ):
         self.hw_profile = HardwareResourceManager.optimize_process_resources()
+        req_ov = True if use_openvino is None else bool(use_openvino)
         self.hw_config = HardwareResourceManager.resolve_device_and_backend(
             requested_device=device,
-            use_openvino=use_openvino,
+            use_openvino=req_ov,
         )
 
         self.backbone_name = backbone_name
@@ -60,10 +62,13 @@ class EdgeAsyncPipeline:
         self.torch_device = self.hw_config["torch_device"]
         self.device = self.torch_device
         self.ov_target_device = self.hw_config["ov_device"]
-        self.use_openvino = bool(use_openvino)
+        self.use_openvino = bool(self.hw_config["use_openvino"]) if use_openvino is None else (
+            bool(use_openvino) and bool(self.hw_config["use_openvino"])
+        )
         self.enable_flip_tta = bool(enable_flip_tta)
         self.enable_env_normalization = bool(enable_env_normalization)
-        self.max_batch_size = max(1, int(max_batch_size))
+        default_bs = int(self.hw_profile.get("optimal_batch_size", 16))
+        self.max_batch_size = max(1, int(max_batch_size if max_batch_size is not None else default_bs))
 
         if target_size is None:
             self.target_size = 224 if backbone_name == "convnextv2_tiny" else 160
@@ -88,11 +93,17 @@ class EdgeAsyncPipeline:
             self._loaded_checkpoint_path = ckpt_p
 
         self.model.to(self.torch_device)
+        try:
+            self.model.to(memory_format=torch.channels_last)
+        except Exception:
+            pass
         self.model.eval()
 
         # 2. OpenVINO runtime acceleration
         self.ov_compiled_model = None
         self.ov_infer_request = None
+        self._ov_source_model_id: Optional[int] = None
+        self._ov_lock = threading.Lock()
         if self.use_openvino and ov is not None:
             self._init_openvino(target_device=self.ov_target_device)
 
@@ -153,9 +164,20 @@ class EdgeAsyncPipeline:
 
             self.ov_compiled_model = compiled
             self.ov_infer_request = compiled.create_infer_request()
+            self._ov_source_model_id = id(self.model)
         except Exception:
             self.ov_compiled_model = None
             self.ov_infer_request = None
+            self._ov_source_model_id = None
+
+    def _run_ov_forward(self, inp: np.ndarray) -> List[np.ndarray]:
+        """Executes forward pass using pre-allocated OpenVINO InferRequest when thread-local."""
+        if self.ov_infer_request is not None:
+            with self._ov_lock:
+                ov_out = self.ov_infer_request.infer([inp])
+                return [np.array(v, dtype=np.float32, copy=True) for v in ov_out.values()]
+        ov_out = self.ov_compiled_model(inp)
+        return [np.asarray(v, dtype=np.float32) for v in ov_out.values()]
 
     def detect_faces(self, frame: np.ndarray) -> List[Dict[str, Any]]:
         """
@@ -196,13 +218,12 @@ class EdgeAsyncPipeline:
         batch_arr = np.stack(crops, axis=0).transpose(0, 3, 1, 2)
         batch_float = np.ascontiguousarray(batch_arr.astype(np.float32) / 127.5 - 1.0)
 
-        if self.ov_compiled_model is not None:
+        if self.ov_compiled_model is not None and id(self.model) == self._ov_source_model_id:
             try:
                 if use_tta:
                     batch_flip = np.ascontiguousarray(batch_float[:, :, :, ::-1])
                     inp_ov = np.concatenate([batch_float, batch_flip], axis=0)
-                    ov_out = self.ov_compiled_model(inp_ov)
-                    vals = [np.asarray(v, dtype=np.float32) for v in ov_out.values()]
+                    vals = self._run_ov_forward(inp_ov)
                     logits_cat = vals[0]
                     g_cat = vals[1].reshape(2 * N)
                     lv_cat = np.clip(vals[2].reshape(2 * N), -6.0, 4.0)
@@ -241,8 +262,7 @@ class EdgeAsyncPipeline:
                     reid_embs = [reid_norm[i] for i in range(N)]
                     return age_preds, std_preds, g_logits, reid_embs
                 else:
-                    ov_out = self.ov_compiled_model(batch_float)
-                    vals = [np.asarray(v, dtype=np.float32) for v in ov_out.values()]
+                    vals = self._run_ov_forward(batch_float)
                     logits = vals[0]
                     g_arr = vals[1].reshape(N)
                     lv_arr = np.clip(vals[2].reshape(N), -6.0, 4.0)
@@ -261,8 +281,12 @@ class EdgeAsyncPipeline:
             except Exception:
                 pass
 
-        # PyTorch execution with torch.inference_mode()
+        # PyTorch execution with torch.inference_mode() and channels_last
         tensor = torch.from_numpy(batch_float).to(self.torch_device)
+        try:
+            tensor = tensor.contiguous(memory_format=torch.channels_last)
+        except Exception:
+            pass
         with torch.inference_mode():
             if hasattr(self.model, "predict_smooth"):
                 out = self.model.predict_smooth(tensor, enable_flip_tta=use_tta)

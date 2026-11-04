@@ -13,11 +13,13 @@ echo ========================================================================
 :: 1. Locate or Auto-Install Python Runtime (>= 3.9)
 :: ------------------------------------------------------------------------
 set "PY_EXE="
+set "VENV_OK=0"
 
 if exist ".venv\Scripts\python.exe" (
     ".venv\Scripts\python.exe" -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)" >nul 2>&1
     if !errorlevel! equ 0 (
         set "PY_EXE=.venv\Scripts\python.exe"
+        set "VENV_OK=1"
     )
 )
 
@@ -55,12 +57,14 @@ echo [1/4] Python Runtime : "%PY_EXE%"
 "%PY_EXE%" -c "import torch, timm, cv2, numpy, scipy, PIL, yaml, openvino" >nul 2>&1
 if %errorlevel% neq 0 (
     echo [2/4] Phat hien thiet bi chua du thu vien moi truong. Dang khoi tao .venv va tu dong tai tai nguyen...
-    if not exist ".venv\Scripts\python.exe" (
-        "%PY_EXE%" -m venv .venv
-        if !errorlevel! neq 0 (
-            echo [CANH BAO] Khong tao duoc .venv, chuyen sang cai dat truc tiep tren Python hien tai...
-        ) else (
-            set "PY_EXE=.venv\Scripts\python.exe"
+    if "!VENV_OK!"=="0" (
+        "%PY_EXE%" -m venv --clear .venv >nul 2>&1
+        if exist ".venv\Scripts\python.exe" (
+            ".venv\Scripts\python.exe" -c "import sys" >nul 2>&1
+            if !errorlevel! equ 0 (
+                set "PY_EXE=.venv\Scripts\python.exe"
+                set "VENV_OK=1"
+            )
         )
     ) else (
         set "PY_EXE=.venv\Scripts\python.exe"
@@ -72,7 +76,10 @@ if %errorlevel% neq 0 (
     powershell -NoProfile -Command "if (Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match 'NVIDIA' }) { exit 0 } else { exit 1 }" >nul 2>&1
     if !errorlevel! equ 0 (
         echo       - Phat hien GPU NVIDIA: Dang tai PyTorch CUDA + cac thu vien...
-        "%PY_EXE%" -m pip install torch --index-url https://download.pytorch.org/whl/cu121
+        "%PY_EXE%" -m pip install torch --index-url https://download.pytorch.org/whl/cu124
+        if !errorlevel! neq 0 (
+            "%PY_EXE%" -m pip install torch --index-url https://download.pytorch.org/whl/cu121
+        )
     )
 
     echo       - Dang cai dat cac goi trong requirements.txt...
@@ -88,18 +95,18 @@ if %errorlevel% neq 0 (
 )
 
 :: ------------------------------------------------------------------------
-:: 3. Verify & Auto-Fetch Required Model Weights
+:: 3. Verify & Auto-Fetch Required Model Weights (Atomic Download)
 :: ------------------------------------------------------------------------
 if not exist "models" mkdir "models"
 
 if not exist "models\face_detection_yunet_2023mar.onnx" (
     echo [3/4] Dang tu dong tai model phat hien khuon mat YuNet ONNX...
-    "%PY_EXE%" -c "import urllib.request; urllib.request.urlretrieve('https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx', 'models/face_detection_yunet_2023mar.onnx')"
+    "%PY_EXE%" -c "import os, urllib.request; p='models/face_detection_yunet_2023mar.onnx'; t=p+'.tmp'; urllib.request.urlretrieve('https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx', t); assert os.path.getsize(t)>100000; os.replace(t, p)"
 )
 
 if not exist "models\convnextv2_tiny_biometrics.pt" (
     echo [3/4] Dang tu dong tai model ConvNeXt-V2 Biometrics tu kho luu tru...
-    "%PY_EXE%" -c "import urllib.request; urllib.request.urlretrieve('https://github.com/thanhmuefatty07/face-detection-gender-age/raw/main/models/convnextv2_tiny_biometrics.pt', 'models/convnextv2_tiny_biometrics.pt')"
+    "%PY_EXE%" -c "import os, urllib.request; p='models/convnextv2_tiny_biometrics.pt'; t=p+'.tmp'; urllib.request.urlretrieve('https://github.com/thanhmuefatty07/face-detection-gender-age/raw/main/models/convnextv2_tiny_biometrics.pt', t); assert os.path.getsize(t)>10000000; os.replace(t, p)"
 )
 
 echo [3/4] Model weights da san sang.

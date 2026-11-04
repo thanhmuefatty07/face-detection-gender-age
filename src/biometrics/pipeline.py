@@ -45,14 +45,15 @@ class BiometricPipeline:
         checkpoint_path: Optional[Any] = None,
         device: str = "cpu",
         enable_env_normalization: bool = True,
-        max_batch_size: int = 16,
+        max_batch_size: Optional[int] = None,
     ):
-        HardwareResourceManager.optimize_process_resources()
+        hw_profile = HardwareResourceManager.optimize_process_resources()
         hw_cfg = HardwareResourceManager.resolve_device_and_backend(requested_device=device, use_openvino=False)
         self.torch_device = hw_cfg["torch_device"]
         self.device = self.torch_device
         self.enable_env_normalization = bool(enable_env_normalization)
-        self.max_batch_size = max(1, int(max_batch_size))
+        default_bs = int(hw_profile.get("optimal_batch_size", 16))
+        self.max_batch_size = max(1, int(max_batch_size if max_batch_size is not None else default_bs))
 
         if target_size is None:
             self.target_size = 224 if checkpoint_path is not None else 160
@@ -89,6 +90,10 @@ class BiometricPipeline:
                 except RuntimeError:
                     estimator_model.load_state_dict(state_dict, strict=False)
                 estimator_model.to(self.torch_device)
+                try:
+                    estimator_model.to(memory_format=torch.channels_last)
+                except Exception:
+                    pass
                 estimator_model.eval()
         self.estimator_model = estimator_model
         self.enable_flip_tta = enable_flip_tta

@@ -84,6 +84,7 @@ class CloudInferenceClient:
                 use_openvino=hw_cfg["use_openvino"],
                 device=self.device,
                 target_size=self.target_size,
+                enable_flip_tta=(hw_cfg["torch_device"] == "cuda"),
             )
         return self._local_edge
 
@@ -236,7 +237,11 @@ class CloudInferenceClient:
                 has_meas = True
             else:
                 age_pred = 25.0
-                std_pred = 1.0
+                existing_kf = self.locker.age_filters.get(t.track_id)
+                if existing_kf is not None and t.track_id in self.locker._measured_tracks:
+                    std_pred = float(np.sqrt(max(0.25, existing_kf.var)))
+                else:
+                    std_pred = 1.0
                 g_logit = 0.0
                 has_meas = False
 
@@ -431,7 +436,7 @@ class CloudInferenceClient:
 
         fps = 0.0
         rtt_lat = 0.0
-        cached_results: Optional[List[Dict[str, Any]]] = None
+        has_local_edge_active = False
         last_det_count = 0
 
         try:
@@ -453,8 +458,16 @@ class CloudInferenceClient:
 
                 # Automatic local Edge inference when cloud is disabled or unreachable
                 if cloud_res is None and self.enable_local_fallback and local_dets:
+                    all_tracks_measured = (
+                        len(self.tracker.tracked_tracks) > 0
+                        and all(
+                            t.track_id in self.locker._measured_tracks
+                            for t in self.tracker.tracked_tracks
+                        )
+                    )
                     need_fresh_infer = (
-                        cached_results is None
+                        not has_local_edge_active
+                        or not all_tracks_measured
                         or len(local_dets) != last_det_count
                         or (frame_count % max(1, infer_interval) == 1)
                     )
@@ -462,10 +475,13 @@ class CloudInferenceClient:
                         t_inf = time.perf_counter()
                         cloud_res = self.infer_locally(local_dets)
                         rtt_lat = (time.perf_counter() - t_inf) * 1000.0
-                        cached_results = cloud_res
+                        has_local_edge_active = True
                         last_det_count = len(local_dets)
                     else:
-                        cloud_res = cached_results
+                        # On skipped frames, do NOT re-apply positional cached_results (which would
+                        # swap identities if detection order changes and double-count Kalman updates).
+                        # Passing cloud_res=None updates spatial track boxes while coasting Kalman states.
+                        cloud_res = None
                     mode_label = f"LOCAL-EDGE (Port {stream.port_info.port})"
 
                 targets = self.update_local_tracks(local_dets=local_dets, cloud_results=cloud_res)
@@ -480,7 +496,7 @@ class CloudInferenceClient:
                     targets,
                     fps=fps,
                     latency_ms=rtt_lat,
-                    cloud_connected=(cloud_res is not None or not use_cloud),
+                    cloud_connected=(cloud_res is not None or has_local_edge_active or not use_cloud),
                     mode_label=mode_label,
                 )
 

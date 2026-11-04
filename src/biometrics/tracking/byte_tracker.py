@@ -198,24 +198,52 @@ def compute_cosine_distance_matrix(
     feats_a: List[Optional[np.ndarray]],
     feats_b: List[Optional[np.ndarray]],
 ) -> np.ndarray:
-    """Computes pairwise cosine distance (1 - cos) between two lists of Re-ID vectors."""
+    """Computes vectorized pairwise cosine distance (1 - cos) between two lists of Re-ID vectors."""
     N = len(feats_a)
     M = len(feats_b)
     if N == 0 or M == 0:
         return np.empty((N, M), dtype=np.float32)
 
     mat = np.ones((N, M), dtype=np.float32)
+    valid_a_idx: List[int] = []
+    valid_a_vecs: List[np.ndarray] = []
+    dim: Optional[int] = None
+
     for i, fa in enumerate(feats_a):
         if fa is None:
             continue
-        fa_vec = np.asarray(fa, dtype=np.float32).ravel()
-        for j, fb in enumerate(feats_b):
-            if fb is None:
-                continue
-            fb_vec = np.asarray(fb, dtype=np.float32).ravel()
-            if fa_vec.shape == fb_vec.shape:
-                cos_sim = float(np.dot(fa_vec, fb_vec))
-                mat[i, j] = max(0.0, 1.0 - cos_sim)
+        vec = np.asarray(fa, dtype=np.float32).ravel()
+        if vec.size == 0:
+            continue
+        if dim is None:
+            dim = vec.size
+        if vec.size == dim:
+            norm = float(np.linalg.norm(vec))
+            valid_a_idx.append(i)
+            valid_a_vecs.append(vec / norm if norm > 1e-8 else vec)
+
+    if not valid_a_idx or dim is None:
+        return mat
+
+    valid_b_idx: List[int] = []
+    valid_b_vecs: List[np.ndarray] = []
+    for j, fb in enumerate(feats_b):
+        if fb is None:
+            continue
+        vec = np.asarray(fb, dtype=np.float32).ravel()
+        if vec.size == dim:
+            norm = float(np.linalg.norm(vec))
+            valid_b_idx.append(j)
+            valid_b_vecs.append(vec / norm if norm > 1e-8 else vec)
+
+    if not valid_b_idx:
+        return mat
+
+    A = np.stack(valid_a_vecs, axis=0)  # (Na, D)
+    B = np.stack(valid_b_vecs, axis=0)  # (Mb, D)
+    cos_sim = A @ B.T
+    dist_sub = np.clip(1.0 - cos_sim, 0.0, 2.0).astype(np.float32)
+    mat[np.ix_(valid_a_idx, valid_b_idx)] = dist_sub
     return mat
 
 
@@ -278,11 +306,12 @@ class ByteTracker:
 
         if cost_m1.size > 0:
             # Fuse Re-ID cosine distance into Tier-1 assignment matrix when both sides have embeddings
-            # to disambiguate crossing trajectories of multiple simultaneous targets
+            # to disambiguate crossing trajectories or partial occlusions of multiple targets
             assign_cost_1 = cost_m1.copy()
             any_reid_t = any(t.reid_feat is not None for t in self.tracked_tracks)
             any_reid_d = any(d.reid_feat is not None for d in dets_high)
-            if any_reid_t and any_reid_d and len(self.tracked_tracks) > 1 and len(dets_high) > 1:
+            reid_m1 = None
+            if any_reid_t and any_reid_d and (len(self.tracked_tracks) > 1 or len(dets_high) > 1):
                 reid_m1 = compute_cosine_distance_matrix(
                     [t.reid_feat for t in self.tracked_tracks],
                     [d.reid_feat for d in dets_high],
@@ -294,12 +323,21 @@ class ByteTracker:
                         if dt.reid_feat is None:
                             continue
                         if cost_m1[r_i, c_i] <= 0.8:
-                            assign_cost_1[r_i, c_i] = 0.80 * cost_m1[r_i, c_i] + 0.20 * reid_m1[r_i, c_i]
+                            assign_cost_1[r_i, c_i] = 0.75 * cost_m1[r_i, c_i] + 0.25 * reid_m1[r_i, c_i]
 
             row_ind, col_ind = linear_sum_assignment(assign_cost_1)
             for r, c in zip(row_ind, col_ind):
                 # IoU threshold = 0.2 -> distance <= 0.8
                 if cost_m1[r, c] <= 0.8:
+                    # Reject severe appearance conflict when spatial overlap is ambiguous (e.g. occlusion crossing)
+                    if (
+                        reid_m1 is not None
+                        and self.tracked_tracks[r].reid_feat is not None
+                        and dets_high[c].reid_feat is not None
+                        and cost_m1[r, c] > 0.30
+                        and reid_m1[r, c] > 0.65
+                    ):
+                        continue
                     self.tracked_tracks[r].update(dets_high[c])
                     matched_tracks_1.add(r)
                     matched_dets_high_1.add(c)
@@ -354,7 +392,18 @@ class ByteTracker:
             matched_dets_reid = set()
 
             if cost_reid.size > 0:
-                row_ind, col_ind = linear_sum_assignment(cost_reid)
+                # Build unified assignment cost matrix: use Re-ID cost when both track and detection
+                # have Re-ID embeddings, otherwise fall back to spatial IoU distance so lost tracks
+                # without Re-ID features are still optimally matched by Hungarian assignment.
+                lost_assign_cost = np.ones_like(cost_reid, dtype=np.float32)
+                for r_i, lt in enumerate(self.lost_tracks):
+                    for c_i, ud in enumerate(unmatched_dets_high):
+                        if lt.reid_feat is not None and ud.reid_feat is not None:
+                            lost_assign_cost[r_i, c_i] = cost_reid[r_i, c_i]
+                        elif cost_iou.size > 0:
+                            lost_assign_cost[r_i, c_i] = cost_iou[r_i, c_i]
+
+                row_ind, col_ind = linear_sum_assignment(lost_assign_cost)
                 for r, c in zip(row_ind, col_ind):
                     has_reid = (
                         self.lost_tracks[r].reid_feat is not None

@@ -121,7 +121,10 @@ def main():
         print_camera_scan_report()
         return
 
-    if args.camera.strip().lower() in ("auto", "scan", "default", ""):
+    if args.camera.strip().lower() in ("demo", "synthetic"):
+        args.demo = True
+        cam_source = "demo"
+    elif args.camera.strip().lower() in ("auto", "scan", "default", ""):
         cam_source = "auto"
     else:
         try:
@@ -143,8 +146,10 @@ def main():
             print("💡 Chưa phát hiện camera vật lý -> Tự động kích hoạt luồng giả lập đa mục tiêu (Demo Mode).")
             args.demo = True
             cam_source = "demo"
+            best_cam = CameraPortScanner.find_best_camera_port("demo")
     elif not best_cam.can_read and args.demo:
         cam_source = "demo"
+        best_cam = CameraPortScanner.find_best_camera_port("demo")
     elif best_cam.can_read:
         cam_source = best_cam.port
 
@@ -153,8 +158,8 @@ def main():
     print("=" * 72)
     print("🚀 Biometric Multi-Target Locker [ConvNeXt-V2 224x224]")
     print(
-        f"⚙️  Tài nguyên máy : {hw_profile['logical_cores']} luồng CPU "
-        f"(OpenCV SIMD={hw_profile['opencv_simd_optimized']}) | "
+        f"⚙️  Tài nguyên máy : {hw_profile['physical_cores']} nhân vật lý / {hw_profile['logical_cores']} luồng CPU | "
+        f"RAM khả dụng {hw_profile.get('available_ram_gb', 0.0):.1f}/{hw_profile.get('total_ram_gb', 0.0):.1f} GB | "
         f"Backend={hw_backend['ov_device'] if hw_backend['use_openvino'] else hw_backend['torch_device'].upper()}"
     )
     print(
