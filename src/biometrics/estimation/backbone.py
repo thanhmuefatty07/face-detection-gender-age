@@ -1,18 +1,28 @@
 """
-Biometric Multi-Task Deep Neural Architectures
-=============================================
-Provides modular PyTorch multi-task backbones:
-1. ConvNeXt-V2-Tiny (Pareto Sweet Spot): Multi-scale hierarchical feature extraction.
-2. MultiScaleBiometricFusion:
-   - Stage 2 (20x20): micro-epidermal texture, wrinkles, pores.
-   - Stage 3 (10x10): mesoscopic facial contours, landmarks.
-   - Stage 4 (5x5): macro craniofacial bone structure.
+Biometric Multi-Task Deep Neural Architectures (ConvNeXt-V2 Biometric Edition)
+==============================================================================
+Provides a mathematically, biologically, and photometrically grounded ConvNeXt-V2
+multi-task architecture engineered for 23-bracket (3-5 year) age intervals,
+continuous 101-bin Label Distribution Learning (LDL), craniofacial dimorphic gender,
+heteroscedastic aleatoric uncertainty, and 64-D unit-hypersphere Re-ID:
+
+1. PhotometricRetinexStem (Lambertian-Specular Dichromatic Decomposition):
+   - Multi-scale homomorphic log-reflectance extraction (Weber-Fechner / Retinex)
+     canceling directional raking illumination gradients and cast shadows.
+   - Differentiable luminance reliability envelope w(Y) = 4*Y*(1-Y) suppressing
+     specular highlight bloom and low-light read-noise floors.
+   - ConvNeXt-V2 Global Response Normalization (GRN) residual gating.
+2. ConvNeXt-V2 Backbone + MultiScaleBiometricFusion with GRN & Bilateral Symmetry:
+   - Stage 2 (20x20): micro-epidermal rhytids, wrinkles, pores (CoordinateAttention + Bilateral Symmetry).
+   - Stage 3 (10x10): mesoscopic facial contours, landmarks (CoordinateAttention + Bilateral Symmetry).
+   - Stage 4 (5x5): macro craniofacial bone structure (strictly isolated for Gender & Re-ID).
    - 1x1 Conv -> 128-ch projection + Mixed Dual-Pooling (GAP || GMP) -> 256-D per stage.
-   - Concatenated [z2 || z3 || z4] (768-D) -> Linear + LayerNorm -> z_fused (512-D).
-3. Head Routing Separation:
-   - Head 1 (Age LDL): 512-D z_fused -> 101-bin Softmax continuous distribution.
-   - Head 2 (Gender): 256-D z4 ONLY -> dimorphism logit (cranial macro-structure invariance).
-   - Head 3 (Aleatoric Uncertainty): 512-D z_fused -> log-variance.
+   - Concatenated [z2 || z3 || z4] (768-D) -> Linear + LayerNorm + GRN1D residual -> z_fused (512-D).
+3. Hierarchical Coarse-to-Fine Head Routing Separation:
+   - Head 1A (23-Bracket Fine Interval Prior): 512-D z_fused -> 23 coarse-to-fine biological stage logits.
+   - Head 1B (101-Bin Continuous Age LDL): 512-D z_fused -> 101 fine logits coupled with 23-bracket prior.
+   - Head 2 (Gender): 256-D z4 ONLY -> dimorphism logit (macro craniofacial bone invariance).
+   - Head 3 (Aleatoric Uncertainty): 512-D z_fused -> log-variance log(sigma^2).
    - Head 4 (Re-ID Identity): 256-D z4 ONLY -> 64-D unit-sphere normalized vector.
 """
 
@@ -27,6 +37,157 @@ try:
     import timm
 except ImportError:
     timm = None
+
+from .intervals import FINE_AGE_INTERVALS, NUM_FINE_AGE_INTERVALS
+
+
+def _build_fine_interval_partition_matrix(num_age_bins: int = 101) -> torch.Tensor:
+    """
+    Constructs the exact binary partition matrix M in {0, 1}^{K x 23}
+    mapping K integer age bins [0..K-1] to the 23 fine 3-5 year age intervals.
+    """
+    mat = torch.zeros((num_age_bins, NUM_FINE_AGE_INTERVALS), dtype=torch.float32)
+    for iv_idx, (_, low, high) in enumerate(FINE_AGE_INTERVALS):
+        if int(low) < num_age_bins:
+            l_clamped = max(0, int(low))
+            h_clamped = min(num_age_bins - 1, int(high))
+            if h_clamped >= l_clamped:
+                mat[l_clamped : h_clamped + 1, iv_idx] = 1.0
+    return mat
+
+
+class GlobalResponseNorm2d(nn.Module):
+    """
+    ConvNeXt-V2 Global Response Normalization for 2D feature maps (Woo et al., CVPR 2023).
+    Enhances inter-channel feature competition and prevents channel collapse under
+    extreme illumination contrast or sensor noise:
+        g_c = ||X_c||_2,  nu_c = g_c / (mean_j(g_j) + eps)
+        GRN(X)_c = X_c + gamma_c * (X_c * nu_c) + beta_c
+    Computes spatial L2 norm in float32 to prevent FP16 overflow on 160x160 maps.
+    """
+
+    def __init__(self, channels: int, eps: float = 1e-6):
+        super().__init__()
+        self.channels = int(channels)
+        self.eps = float(eps)
+        self.gamma = nn.Parameter(torch.zeros(1, channels, 1, 1))
+        self.beta = nn.Parameter(torch.zeros(1, channels, 1, 1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        orig_dtype = x.dtype
+        x_f = x.float()
+        gx = torch.sqrt(torch.mean(x_f * x_f, dim=(2, 3), keepdim=True) + self.eps)
+        nx = gx / (gx.mean(dim=1, keepdim=True) + self.eps)
+        out = x_f + self.gamma.float() * (x_f * nx) + self.beta.float()
+        return out.to(dtype=orig_dtype)
+
+
+class GlobalResponseNorm1d(nn.Module):
+    """
+    ConvNeXt-V2 Global Response Normalization for 1D feature embeddings (B, D).
+    Promotes neuron diversity across multi-scale fused biometric representations.
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.dim = int(dim)
+        self.eps = float(eps)
+        self.gamma = nn.Parameter(torch.zeros(1, dim))
+        self.beta = nn.Parameter(torch.zeros(1, dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        orig_dtype = x.dtype
+        x_f = x.float()
+        gx = torch.abs(x_f)
+        nx = gx / (gx.mean(dim=-1, keepdim=True) + self.eps)
+        out = x_f + self.gamma.float() * (x_f * nx) + self.beta.float()
+        return out.to(dtype=orig_dtype)
+
+
+class PhotometricRetinexStem(nn.Module):
+    """
+    Physical Dichromatic & Multi-Scale Retinex (MSR) Illumination-Invariant Stem Adapter.
+
+    Models Lambertian + Specular surface optics:
+        I(x, y) = R_albedo(x, y) * L_illumination(x, y) + S_specular(x, y)
+
+    1. Extracts Multi-Scale Retinex log-reflectance at fine epidermal scale (sigma=1.2)
+       and mesoscopic facial-plane scale (sigma=2.5), canceling multiplicative lighting
+       gradients (raking side-light, harsh shadows, exposure shifts).
+    2. Applies a differentiable photometric reliability gate w(Y) = 4*Y*(1-Y) on CIE luminance Y
+       to attenuate saturated specular glare (Y -> 1) and dark read-noise floors (Y -> 0).
+    3. Refines intrinsic reflectance via a depthwise ConvNeXt-V2 GRN block and injects it into
+       the input via a bounded LayerScale residual gate tanh(residual_gate).
+    """
+
+    def __init__(
+        self,
+        channels: int = 3,
+        hidden_channels: int = 24,
+        hidden_dim: Optional[int] = None,
+        eps: float = 1e-4,
+    ):
+        super().__init__()
+        if hidden_dim is not None:
+            hidden_channels = int(hidden_dim)
+        self.channels = int(channels)
+        self.eps = float(eps)
+        self.register_buffer("kernel_fine", self._build_gaussian_kernel(kernel_size=5, sigma=1.2))
+        self.register_buffer("kernel_coarse", self._build_gaussian_kernel(kernel_size=9, sigma=2.5))
+        self.register_buffer(
+            "luma_weights",
+            torch.tensor([0.299, 0.587, 0.114], dtype=torch.float32).view(1, 3, 1, 1),
+        )
+        self.dw_conv = nn.Conv2d(10, 10, kernel_size=5, padding=2, groups=10, bias=False)
+        self.norm = nn.GroupNorm(num_groups=2, num_channels=10)
+        self.pw_expand = nn.Conv2d(10, hidden_channels, kernel_size=1)
+        self.act = nn.GELU()
+        self.grn = GlobalResponseNorm2d(hidden_channels)
+        self.pw_proj = nn.Conv2d(hidden_channels, 3, kernel_size=1)
+        self.residual_gate = nn.Parameter(torch.tensor(0.15, dtype=torch.float32))
+
+    @staticmethod
+    def _build_gaussian_kernel(kernel_size: int, sigma: float) -> torch.Tensor:
+        coords = torch.arange(kernel_size, dtype=torch.float32) - (kernel_size - 1) / 2.0
+        g1d = torch.exp(-(coords ** 2) / (2.0 * (sigma ** 2)))
+        g2d = torch.outer(g1d, g1d)
+        g2d = g2d / torch.sum(g2d)
+        return g2d.view(1, 1, kernel_size, kernel_size).repeat(3, 1, 1, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not torch.jit.is_tracing() and (x.ndim != 4 or x.shape[1] != 3):
+            return x
+        orig_dtype = x.dtype
+        x_f = x.float()
+        img_01 = torch.clamp((x_f + 1.0) * 0.5, min=self.eps, max=1.0)
+        log_i = torch.log(img_01 + self.eps)
+        pad_f = self.kernel_fine.shape[-1] // 2
+        pad_c = self.kernel_coarse.shape[-1] // 2
+        if torch.jit.is_tracing():
+            mode_f = "reflect"
+            mode_c = "reflect"
+        else:
+            h_in, w_in = img_01.shape[2], img_01.shape[3]
+            mode_f = "reflect" if (h_in > pad_f and w_in > pad_f) else "replicate"
+            mode_c = "reflect" if (h_in > pad_c and w_in > pad_c) else "replicate"
+        illum_fine = F.conv2d(
+            F.pad(img_01, (pad_f, pad_f, pad_f, pad_f), mode=mode_f),
+            self.kernel_fine.float(),
+            groups=3,
+        )
+        r_fine = log_i - torch.log(torch.clamp(illum_fine, min=self.eps))
+        illum_coarse = F.conv2d(
+            F.pad(img_01, (pad_c, pad_c, pad_c, pad_c), mode=mode_c),
+            self.kernel_coarse.float(),
+            groups=3,
+        )
+        r_coarse = log_i - torch.log(torch.clamp(illum_coarse, min=self.eps))
+        luma = torch.sum(img_01 * self.luma_weights.float(), dim=1, keepdim=True)
+        exposure_weight = 4.0 * luma * (1.0 - luma)
+        feat_in = torch.cat([x_f, r_fine, r_coarse, exposure_weight], dim=1).to(dtype=self.dw_conv.weight.dtype)
+        delta = self.pw_proj(self.grn(self.act(self.pw_expand(self.norm(self.dw_conv(feat_in)))))).float()
+        out = torch.clamp(x_f + torch.tanh(self.residual_gate.float()) * delta, min=-2.5, max=2.5)
+        return out.to(dtype=orig_dtype)
 
 
 class CoordinateAttention(nn.Module):
@@ -81,25 +242,13 @@ class CoordinateAttention(nn.Module):
 
 class MultiScaleBiometricFusion(nn.Module):
     """
-    Multi-Scale Biometric Feature Fusion with Stage 2 Coordinate Attention.
+    Multi-Scale Biometric Feature Fusion with Coordinate Attention, Bilateral Craniofacial
+    Symmetry Compensation, and ConvNeXt-V2 Global Response Normalization (GRN).
     
     Extracts and fuses hierarchical spatial features:
-    - Stage 2: (B, C2, 20, 20) -> Coordinate Attention micro-epidermal textures, wrinkles, and pores
-    - Stage 3: (B, C3, 10, 10) -> mesoscopic facial contours and landmarks
+    - Stage 2: (B, C2, 20, 20) -> Coordinate Attention + Bilateral Symmetry micro-epidermal textures, wrinkles, pores
+    - Stage 3: (B, C3, 10, 10) -> Coordinate Attention + Bilateral Symmetry mesoscopic facial contours and landmarks
     - Stage 4: (B, C4, 5, 5)   -> macro craniofacial bone structure
-    
-    Processing:
-    For stage k in {2, 3, 4}:
-      1. Stage 2 CoordinateAttention (direction-aware X/Y localization)
-      2. 1x1 Conv projection (C_k -> 128)
-      3. Mixed Dual-Pooling: [AdaptiveAvgPool2d((1, 1)) || AdaptiveMaxPool2d((1, 1))] -> z_k in R^256
-    
-    Fusion:
-      [z2 || z3 || z4] in R^768 -> Linear(768, 512) + LayerNorm(512) -> z_fused in R^512
-    
-    Head Routing:
-      - z_fused (512-D) routes to Age LDL & Aleatoric Uncertainty heads
-      - z4 (256-D) routes ONLY to Gender & Re-ID heads (macro craniofacial invariance)
     """
 
     def __init__(
@@ -116,10 +265,16 @@ class MultiScaleBiometricFusion(nn.Module):
         self.macro_dim = proj_dim * 2  # 256
         self.use_coord_att = use_coord_att
 
-        self.coord_att2 = CoordinateAttention(c2) if use_coord_att else nn.Identity()
-        self.proj2 = nn.Conv2d(c2, proj_dim, kernel_size=1)
-        self.proj3 = nn.Conv2d(c3, proj_dim, kernel_size=1)
-        self.proj4 = nn.Conv2d(c4, proj_dim, kernel_size=1)
+        self.coord_att2 = CoordinateAttention(c2, reduction=16) if use_coord_att else nn.Identity()
+        self.coord_att3 = CoordinateAttention(c3, reduction=16) if use_coord_att else nn.Identity()
+
+        # Learnable bilateral sagittal symmetry gates for Stage 2 & Stage 3
+        self.sym_gate2 = nn.Parameter(torch.zeros(1, c2, 1, 1))
+        self.sym_gate3 = nn.Parameter(torch.zeros(1, c3, 1, 1))
+
+        self.proj2 = nn.Conv2d(c2, proj_dim, kernel_size=1, bias=False)
+        self.proj3 = nn.Conv2d(c3, proj_dim, kernel_size=1, bias=False)
+        self.proj4 = nn.Conv2d(c4, proj_dim, kernel_size=1, bias=False)
 
         self.avg_pool = nn.AdaptiveAvgPool2d((1, 1))
         self.max_pool = nn.AdaptiveMaxPool2d((1, 1))
@@ -128,11 +283,30 @@ class MultiScaleBiometricFusion(nn.Module):
             nn.Linear(proj_dim * 2 * 3, fused_dim),
             nn.LayerNorm(fused_dim),
         )
+        # ConvNeXt-V2 Global Response Normalization (GRN) residual block on fused representation
+        self.fusion_grn_block = nn.Sequential(
+            nn.Linear(fused_dim, fused_dim),
+            nn.GELU(),
+            GlobalResponseNorm1d(fused_dim),
+            nn.Linear(fused_dim, fused_dim),
+        )
+        self.fusion_norm = nn.LayerNorm(fused_dim)
+
+    @staticmethod
+    def _apply_bilateral_symmetry(feat: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        if not torch.jit.is_tracing():
+            if feat.ndim != 4 or feat.shape[3] <= 1:
+                return feat
+        feat_mirror = torch.flip(feat, dims=[3])
+        diff = 0.5 * (feat_mirror - feat)
+        scale = torch.abs(feat) + 0.25
+        cauchy_w = 1.0 / (1.0 + (diff / scale) ** 2)
+        return feat + torch.tanh(gate.to(dtype=feat.dtype)) * (diff * cauchy_w)
 
     def _pool_stage(self, feat: torch.Tensor, proj_layer: nn.Module) -> torch.Tensor:
-        if feat.ndim == 2:
+        if not torch.jit.is_tracing() and feat.ndim == 2:
             feat = feat.unsqueeze(-1).unsqueeze(-1)
-        p = proj_layer(feat)
+        p = proj_layer(feat.contiguous())
         avg_p = torch.flatten(self.avg_pool(p), 1)
         max_p = torch.flatten(self.max_pool(p), 1)
         return torch.cat([avg_p, max_p], dim=-1)
@@ -140,13 +314,16 @@ class MultiScaleBiometricFusion(nn.Module):
     def forward(
         self, stage2: torch.Tensor, stage3: torch.Tensor, stage4: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        stage2_enhanced = self.coord_att2(stage2)
+        stage2_enhanced = self._apply_bilateral_symmetry(self.coord_att2(stage2), self.sym_gate2)
+        stage3_enhanced = self._apply_bilateral_symmetry(self.coord_att3(stage3), self.sym_gate3)
+
         z2 = self._pool_stage(stage2_enhanced, self.proj2)  # (B, 256)
-        z3 = self._pool_stage(stage3, self.proj3)          # (B, 256)
-        z4 = self._pool_stage(stage4, self.proj4)          # (B, 256)
+        z3 = self._pool_stage(stage3_enhanced, self.proj3)  # (B, 256)
+        z4 = self._pool_stage(stage4, self.proj4)           # (B, 256) - Strictly isolated Stage 4
 
         concat_z = torch.cat([z2, z3, z4], dim=-1)          # (B, 768)
-        z_fused = self.fusion(concat_z)                      # (B, 512)
+        z_base = self.fusion(concat_z)                      # (B, 512)
+        z_fused = self.fusion_norm(z_base + 0.25 * self.fusion_grn_block(z_base))
         return z_fused, z4
 
 
@@ -216,7 +393,7 @@ class MobileNetV4BiometricHead(nn.Module):
 
 
 class FallbackStem(nn.Module):
-    """Lightweight multi-stage convolutional feature extractor fallback if timm is unavailable."""
+    """Lightweight multi-stage ConvNeXt-V2-style feature extractor fallback if timm is unavailable."""
 
     def __init__(
         self,
@@ -240,16 +417,19 @@ class FallbackStem(nn.Module):
             nn.Conv2d(96, c2, kernel_size=3, stride=2, padding=1),  # 20x20
             nn.BatchNorm2d(c2),
             nn.SiLU(),
+            GlobalResponseNorm2d(c2),
         )
         self.stage3 = nn.Sequential(
             nn.Conv2d(c2, c3, kernel_size=3, stride=2, padding=1),  # 10x10
             nn.BatchNorm2d(c3),
             nn.SiLU(),
+            GlobalResponseNorm2d(c3),
         )
         self.stage4 = nn.Sequential(
             nn.Conv2d(c3, c4, kernel_size=3, stride=2, padding=1),  # 5x5
             nn.BatchNorm2d(c4),
             nn.SiLU(),
+            GlobalResponseNorm2d(c4),
         )
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -262,10 +442,16 @@ class FallbackStem(nn.Module):
 
 class BiometricMultiTaskModel(nn.Module):
     """
-    Unified multi-task biometric model with MultiScaleBiometricFusion.
+    Unified ConvNeXt-V2 Multi-Task Biometric Model with:
+    - PhotometricRetinexStem (Lambertian-Specular illumination invariance)
+    - MultiScaleBiometricFusion (CoordinateAttention + Bilateral Symmetry + ConvNeXt-V2 GRN)
+    - Hierarchical Coarse-to-Fine 23-Interval + 101-Bin Continuous Age LDL Head
+    - Macro-Isolated Craniofacial Dimorphic Gender & 64-D Unit-Hypersphere Re-ID Heads
+
     Accepts 160x160 aligned face tensor: (B, 3, 160, 160).
     Extracts:
-    1. 101-bin age probability simplex & expected continuous age (via z_fused: Stage 2+3+4).
+    1. 23-bracket (3-5 yr) age interval probabilities & 101-bin age probability simplex
+       & expected continuous age (via z_fused: Stage 2+3+4).
     2. Gender logit and probability (via z4: Stage 4 macro craniofacial invariance).
     3. Aleatoric uncertainty log-variance & standard deviation (via z_fused).
     4. 64-D unit-sphere normalized Re-ID identity embedding (via z4: Stage 4).
@@ -278,11 +464,17 @@ class BiometricMultiTaskModel(nn.Module):
         reid_dim: int = 64,
         pretrained: bool = False,
         drop_path_rate: float = 0.0,
+        use_photometric_stem: bool = True,
     ):
         super().__init__()
         self.backbone_name = backbone_name
         self.num_age_bins = num_age_bins
+        self.num_age_intervals = NUM_FINE_AGE_INTERVALS
         self.reid_dim = reid_dim
+        self.use_photometric_stem = use_photometric_stem
+
+        # Photometric Dichromatic Retinex Stem for extreme lighting / glare / shadow invariance
+        self.photometric_stem = PhotometricRetinexStem(channels=3) if use_photometric_stem else nn.Identity()
 
         # Map generic shorthand names
         actual_name = backbone_name
@@ -320,10 +512,28 @@ class BiometricMultiTaskModel(nn.Module):
         self.in_features = 512
         self.macro_features = 256
 
-        # Head 1: 101-bin continuous Age LDL Head (receives z_fused: 512-D)
+        # Register partition matrix (K, 23) and bin vector (K,) as buffers for zero-overhead GPU execution
+        self.register_buffer(
+            "age_bins_vec",
+            torch.arange(num_age_bins, dtype=torch.float32),
+        )
+        partition_mat = _build_fine_interval_partition_matrix(num_age_bins)
+        self.register_buffer("fine_interval_partition", partition_mat)
+
+        # Head 1A: Coarse-to-Fine 23-Bracket Biological Age Interval Head (receives z_fused: 512-D)
+        self.age_interval_head = nn.Sequential(
+            nn.Linear(512, 192),
+            nn.SiLU(),
+            GlobalResponseNorm1d(192),
+            nn.Linear(192, NUM_FINE_AGE_INTERVALS),
+        )
+        self.hier_interval_scale = nn.Parameter(torch.tensor(0.35, dtype=torch.float32))
+
+        # Head 1B: 101-bin continuous Age LDL Head (receives z_fused: 512-D)
         self.age_ldl_head = nn.Sequential(
             nn.Linear(512, 256),
             nn.SiLU(),
+            GlobalResponseNorm1d(256),
             nn.Linear(256, num_age_bins)
         )
 
@@ -331,6 +541,7 @@ class BiometricMultiTaskModel(nn.Module):
         self.gender_head = nn.Sequential(
             nn.Linear(256, 128),
             nn.SiLU(),
+            GlobalResponseNorm1d(128),
             nn.Linear(128, 1)
         )
 
@@ -353,28 +564,15 @@ class BiometricMultiTaskModel(nn.Module):
         return_dict: Optional[bool] = None,
     ) -> Dict[str, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Forward pass with multi-scale fusion and head routing separation.
-        Args:
-            x: Aligned face tensor (B, 3, 160, 160)
-            return_dict: If False or when torch.jit tracing, returns tuple of tensors for clean export.
-        Returns:
-            Dictionary (default in Python) or Tuple (when tracing / export):
-            - 'age_logits': (B, 101)
-            - 'age_probs': (B, 101) probability simplex
-            - 'expected_age': (B,) scalar continuous expectation
-            - 'age_expected': (B,) alias for backward compatibility
-            - 'gender_logit': (B,) logit (positive = Female)
-            - 'gender_prob': (B,) probability of Female
-            - 'log_variance': (B,) log(sigma^2)
-            - 'aleatoric_std': (B,) sigma
-            - 'reid_embedding': (B, 64) L2-normalized unit sphere embedding
-            - 'features': (B, 512) fused feature embedding z_fused
-            - 'z4': (B, 256) macro Stage 4 feature embedding
+        Forward pass with Photometric Retinex Stem, Multi-Scale Biometric Fusion,
+        Hierarchical 23-Interval + 101-Bin Age Coupling, and Head Routing Separation.
         """
+        x_photo = self.photometric_stem(x)
+
         if isinstance(self.backbone, FallbackStem):
-            s2, s3, s4 = self.backbone(x)
+            s2, s3, s4 = self.backbone(x_photo)
         else:
-            feats = self.backbone(x)
+            feats = self.backbone(x_photo)
             if isinstance(feats, (list, tuple)):
                 if len(feats) >= 3:
                     s2, s3, s4 = feats[-3], feats[-2], feats[-1]
@@ -388,8 +586,17 @@ class BiometricMultiTaskModel(nn.Module):
         # Multi-Scale Biometric Fusion
         z_fused, z4 = self.fusion(s2, s3, s4)
 
-        # Head 1: Age LDL (z_fused: micro + meso + macro)
-        age_logits = self.age_ldl_head(z_fused)
+        # Head 1: Hierarchical 23-Interval + 101-Bin Age LDL (z_fused: micro + meso + macro)
+        fine_age_logits = self.age_ldl_head(z_fused)
+        interval_logits = self.age_interval_head(z_fused)
+        if self.num_age_bins == 101:
+            fine_interval_log_prior = F.log_softmax(interval_logits, dim=-1)
+            part_mat = self.fine_interval_partition.to(dtype=fine_interval_log_prior.dtype)
+            lifted_interval_prior = torch.matmul(fine_interval_log_prior, part_mat.t())
+            scale = F.softplus(self.hier_interval_scale.to(dtype=fine_age_logits.dtype))
+            age_logits = fine_age_logits + scale * lifted_interval_prior
+        else:
+            age_logits = fine_age_logits
         age_probs = F.softmax(age_logits, dim=-1)
 
         # Head 2: Gender (z4 ONLY: macro craniofacial invariance)
@@ -397,24 +604,44 @@ class BiometricMultiTaskModel(nn.Module):
         gender_prob = torch.sigmoid(gender_logit)
 
         # Head 3: Aleatoric Uncertainty (z_fused)
-        log_var = self.uncertainty_head(z_fused).squeeze(-1)
-        aleatoric_std = torch.exp(0.5 * torch.clamp(log_var, min=-10.0, max=10.0))
+        log_var = torch.clamp(self.uncertainty_head(z_fused).squeeze(-1), min=-6.0, max=4.0)
+        aleatoric_std = torch.exp(0.5 * log_var)
 
         # Head 4: Re-ID Identity Embedding (z4 ONLY: unit-sphere normalized)
         reid_raw = self.reid_head(z4)
         reid_emb = F.normalize(reid_raw, p=2, dim=-1)
 
         # Continuous age expectation
-        age_bins = torch.arange(self.num_age_bins, device=x.device, dtype=torch.float32)
-        expected_age = torch.sum(age_probs * age_bins, dim=-1)
+        age_bins_cast = self.age_bins_vec.to(dtype=age_probs.dtype)
+        expected_age = torch.sum(age_probs * age_bins_cast, dim=-1)
 
         # Export compatibility: return tuple for TorchScript and ONNX
         if torch.jit.is_tracing() or return_dict is False:
             return age_logits, gender_logit, log_var, reid_emb
 
+        part_mat_probs = self.fine_interval_partition.to(dtype=age_probs.dtype)
+        gauss_focus = torch.exp(
+            -0.5 * ((age_bins_cast.unsqueeze(0) - expected_age.unsqueeze(-1)) / 1.6) ** 2
+        )
+        focused_probs = age_probs * (0.20 + 0.80 * gauss_focus)
+        age_interval_probs = torch.matmul(focused_probs, part_mat_probs)
+        if self.num_age_bins == 101:
+            iv_head_probs = F.softmax(interval_logits, dim=-1)
+            focus_iv = torch.matmul(gauss_focus, part_mat_probs)
+            age_interval_probs = 0.85 * age_interval_probs + 0.15 * (iv_head_probs * focus_iv)
+        age_interval_probs = age_interval_probs / torch.clamp(
+            age_interval_probs.sum(dim=-1, keepdim=True), min=1e-12
+        )
+        age_interval_idx = torch.argmax(age_interval_probs, dim=-1)
+
         return {
             "age_logits": age_logits,
             "age_probs": age_probs,
+            "age_ldl": age_probs,
+            "fine_interval_logits": interval_logits,
+            "age_interval_logits": interval_logits,
+            "age_interval_probs": age_interval_probs,
+            "age_interval_idx": age_interval_idx,
             "expected_age": expected_age,
             "age_expected": expected_age,
             "gender_logit": gender_logit,
@@ -425,3 +652,109 @@ class BiometricMultiTaskModel(nn.Module):
             "features": z_fused,
             "z4": z4
         }
+
+    @torch.no_grad()
+    def predict_smooth(
+        self,
+        x: torch.Tensor,
+        enable_flip_tta: bool = True,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Smooth, illumination-and-pose-compensated inference via single-batch Bilateral Flip
+        Test-Time Ensembling (Flip-TTA). Executes [x, flip(x)] in one fused GPU/CPU batch
+        to cancel directional lighting shadows and out-of-plane yaw bias.
+        """
+        if not enable_flip_tta:
+            out_single = self.forward(x, return_dict=True)
+            assert isinstance(out_single, dict)
+            out_single["epistemic_std"] = torch.zeros_like(out_single["aleatoric_std"])
+            out_single["total_std"] = out_single["aleatoric_std"]
+            return out_single
+
+        B = x.shape[0]
+        x_flip = torch.flip(x, dims=[3])
+        x_cat = torch.cat([x, x_flip], dim=0)
+        out_cat = self.forward(x_cat, return_dict=True)
+        assert isinstance(out_cat, dict)
+
+        age_probs = 0.5 * (out_cat["age_probs"][:B] + out_cat["age_probs"][B:])
+        age_probs = age_probs / torch.clamp(age_probs.sum(dim=-1, keepdim=True), min=1e-12)
+        age_logits = torch.log(torch.clamp(age_probs, min=1e-8))
+        age_bins_cast = self.age_bins_vec.to(dtype=age_probs.dtype)
+        expected_age = torch.sum(age_probs * age_bins_cast, dim=-1)
+
+        fine_iv_logits = 0.5 * (out_cat["age_interval_logits"][:B] + out_cat["age_interval_logits"][B:])
+        part_mat_probs = self.fine_interval_partition.to(dtype=age_probs.dtype)
+        gauss_focus = torch.exp(
+            -0.5 * ((age_bins_cast.unsqueeze(0) - expected_age.unsqueeze(-1)) / 1.6) ** 2
+        )
+        focused_probs = age_probs * (0.20 + 0.80 * gauss_focus)
+        age_interval_probs = torch.matmul(focused_probs, part_mat_probs)
+        if self.num_age_bins == 101:
+            iv_head_probs = F.softmax(fine_iv_logits, dim=-1)
+            focus_iv = torch.matmul(gauss_focus, part_mat_probs)
+            age_interval_probs = 0.85 * age_interval_probs + 0.15 * (iv_head_probs * focus_iv)
+        age_interval_probs = age_interval_probs / torch.clamp(
+            age_interval_probs.sum(dim=-1, keepdim=True), min=1e-12
+        )
+        age_interval_idx = torch.argmax(age_interval_probs, dim=-1)
+
+        gender_logit = 0.5 * (out_cat["gender_logit"][:B] + out_cat["gender_logit"][B:])
+        gender_prob = torch.sigmoid(gender_logit)
+
+        # Combine aleatoric variance with bilateral epistemic disagreement + hemiface asymmetry variance
+        var_orig = out_cat["aleatoric_std"][:B] ** 2
+        var_flip = out_cat["aleatoric_std"][B:] ** 2
+        aleatoric_std = 0.5 * (out_cat["aleatoric_std"][:B] + out_cat["aleatoric_std"][B:])
+        epistemic_age_diff = 0.5 * torch.abs(out_cat["expected_age"][:B] - out_cat["expected_age"][B:])
+        w_half = x.shape[3] // 2
+        if w_half > 0:
+            left_half = x[:, :, :, :w_half]
+            right_half = torch.flip(x[:, :, :, -w_half:], dims=[3])
+            hemiface_var_gap = torch.abs(
+                torch.var(left_half, dim=(1, 2, 3), unbiased=False)
+                - torch.var(right_half, dim=(1, 2, 3), unbiased=False)
+            )
+            bilateral_penalty = 0.50 * hemiface_var_gap
+        else:
+            bilateral_penalty = torch.zeros_like(aleatoric_std)
+        epistemic_std = torch.sqrt(epistemic_age_diff ** 2 + bilateral_penalty ** 2)
+        gender_disagreement = 0.05 * ((out_cat["gender_logit"][:B] - out_cat["gender_logit"][B:]) ** 2)
+        disagreement_var = (epistemic_std ** 2) + gender_disagreement
+        total_var = 0.5 * (var_orig + var_flip) + disagreement_var
+        total_std = torch.sqrt(torch.clamp(total_var, min=1e-6))
+        log_var = torch.log(torch.clamp(total_var, min=1e-6))
+
+        reid_emb = F.normalize(
+            0.5 * (out_cat["reid_embedding"][:B] + out_cat["reid_embedding"][B:]),
+            p=2,
+            dim=-1,
+        )
+
+        return {
+            "age_logits": age_logits,
+            "age_probs": age_probs,
+            "age_ldl": age_probs,
+            "fine_interval_logits": fine_iv_logits,
+            "age_interval_logits": fine_iv_logits,
+            "age_interval_probs": age_interval_probs,
+            "age_interval_idx": age_interval_idx,
+            "expected_age": expected_age,
+            "age_expected": expected_age,
+            "gender_logit": gender_logit,
+            "gender_prob": gender_prob,
+            "log_variance": log_var,
+            "aleatoric_std": aleatoric_std,
+            "epistemic_std": epistemic_std,
+            "total_std": total_std,
+            "reid_embedding": reid_emb,
+            "features": 0.5 * (out_cat["features"][:B] + out_cat["features"][B:]),
+            "z4": 0.5 * (out_cat["z4"][:B] + out_cat["z4"][B:]),
+        }
+
+
+
+# Alias for explicit ConvNeXt-V2 Biometric naming
+ConvNeXtV2BiometricModel = BiometricMultiTaskModel
+
+

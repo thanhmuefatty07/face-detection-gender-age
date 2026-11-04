@@ -97,3 +97,51 @@ class TestEnvironmentalTransforms:
         out = augmenter(base_face_image)
         assert out.shape == (160, 160, 3)
         assert out.dtype == np.uint8
+
+    def test_raking_directional_lighting_and_planckian_shift(self, base_face_image):
+        from src.mining.augmentation.environmental_transforms import apply_raking_directional_lighting_transform
+
+        # Positive azimuth (+80 deg) illuminates right hemiface and casts shadow on left hemiface
+        lit_right = apply_raking_directional_lighting_transform(
+            base_face_image, azimuth_deg=80.0, elevation_deg=15.0, ambient=0.12, direct_strength=1.35, color_temp_shift=0.25
+        )
+        assert lit_right.shape == (160, 160, 3)
+        assert lit_right.dtype == np.uint8
+        # Right half (x > 85) should have higher mean brightness than shadowed left half (x < 75)
+        assert lit_right[:, 90:145, :].mean() > lit_right[:, 15:70, :].mean()
+
+    def test_perspective_pose_foreshortening_and_isp_degradation(self, base_face_image):
+        from src.mining.augmentation.environmental_transforms import (
+            apply_perspective_pose_foreshortening_transform,
+            apply_isp_degradation_and_compression_transform,
+        )
+
+        warped = apply_perspective_pose_foreshortening_transform(
+            base_face_image, yaw_deg=22.0, pitch_deg=-12.0, roll_deg=6.0
+        )
+        assert warped.shape == (160, 160, 3)
+        assert warped.dtype == np.uint8
+        assert not np.array_equal(warped, base_face_image)
+
+        degraded = apply_isp_degradation_and_compression_transform(
+            base_face_image, downscale_factor=0.45, jpeg_quality=20, chroma_noise_sigma=5.0
+        )
+        assert degraded.shape == (160, 160, 3)
+        assert degraded.dtype == np.uint8
+        assert not np.array_equal(degraded, base_face_image)
+
+    def test_extreme_noise_stress_benchmark_all_7_regimes(self, base_face_image):
+        from src.mining.augmentation.environmental_transforms import ExtremeNoiseStressBenchmark
+
+        assert len(ExtremeNoiseStressBenchmark.REGIMES) == 7
+        clean_out = ExtremeNoiseStressBenchmark.apply_regime_uint8(base_face_image, "clean", seed=123)
+        assert np.array_equal(clean_out, base_face_image)
+
+        for regime in ExtremeNoiseStressBenchmark.REGIMES[1:]:
+            out1 = ExtremeNoiseStressBenchmark.apply_regime_uint8(base_face_image, regime, seed=123)
+            out2 = ExtremeNoiseStressBenchmark.apply_regime_uint8(base_face_image, regime, seed=123)
+            assert out1.shape == (160, 160, 3)
+            assert out1.dtype == np.uint8
+            assert np.array_equal(out1, out2)
+            assert not np.array_equal(out1, base_face_image)
+

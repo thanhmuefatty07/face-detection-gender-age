@@ -1,5 +1,5 @@
 {
-  "id": "vnthanhphm/face-convnextv2-biometric-training",
+  "id": "thanhmuefatty/face-convnext-v2-biometric-training-pipeline",
   "title": "Face ConvNeXt-V2 Biometric Training Pipeline",
   "code_file": "kaggle_training_convnextv2.ipynb",
   "language": "python",
@@ -8,11 +8,10 @@
   "enable_gpu": true,
   "enable_tpu": false,
   "enable_internet": true,
-  "dataset_sources": [
-    "vnthanhphm/face-gender-age-golden-dataset"
-  ],
+  "dataset_sources": [],
   "competition_sources": [],
   "kernel_sources": [
-    "vnthanhphm/face-dataset-mining-extreme-filtering-pipeline"
+    "thanhmuefatty/face-dataset-mining-extreme-filtering-pipeline"
   ]
 }
+

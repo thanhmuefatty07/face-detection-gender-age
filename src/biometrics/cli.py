@@ -20,13 +20,17 @@ def main():
     parser.add_argument("--image", type=str, help="Path to input image file")
     parser.add_argument("--webcam", type=int, default=None, help="Webcam device ID (e.g. 0)")
     parser.add_argument("--engine", type=str, choices=["yunet", "scrfd"], default="yunet", help="Detection engine")
+    parser.add_argument("--checkpoint", type=str, default="models/convnextv2_tiny_biometrics.pt", help="Path to ConvNeXt-V2 checkpoint")
+    parser.add_argument("--target-size", type=int, default=224, help="Canonical Umeyama alignment resolution (default: 224)")
     parser.add_argument("--no-audit", action="store_true", help="Disable extreme quality auditing")
 
     args = parser.parse_args()
 
     pipeline = BiometricPipeline(
         detector_engine=args.engine,
-        enable_quality_audit=not args.no_audit
+        enable_quality_audit=not args.no_audit,
+        checkpoint_path=args.checkpoint,
+        target_size=args.target_size,
     )
 
     if args.image:
@@ -48,7 +52,11 @@ def main():
                 if not audit.passed:
                     print(f"  Rejection reasons: {audit.rejection_reasons}")
             if pred:
-                print(f"  Age: {pred.expected_age:.1f} years (Cohort: {pred.age_cohort_name}, σ={pred.apparent_age_std:.2f})")
+                print(
+                    f"  Age: {pred.age_interval_name} years "
+                    f"(Expected: {pred.expected_age:.1f}y, Conf: {pred.age_interval_confidence:.0%}, "
+                    f"Cohort: {pred.age_cohort_name}, σ={pred.apparent_age_std:.2f})"
+                )
                 print(f"  Gender: {pred.gender} (P(Female)={pred.female_probability:.2f}, w_dim={pred.dimorphism_weight:.2f})")
                 print(f"  Alpha Sample Weight: {pred.alpha_sample_weight:.4f}")
 
@@ -70,7 +78,7 @@ def main():
                 color = (0, 255, 0) if (audit is None or audit.passed) else (0, 0, 255)
                 cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
                 if pred:
-                    label = f"{pred.gender}, {pred.expected_age:.0f}y ({pred.age_cohort_name})"
+                    label = f"{pred.gender}, {pred.age_interval_name}y ({pred.expected_age:.0f}y)"
                     cv2.putText(frame, label, (x, max(20, y - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
             cv2.imshow("SOTA Biometrics (Decoupled Dual-Engine)", frame)

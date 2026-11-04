@@ -7,7 +7,7 @@ Layer 2: 512-d Cosine distance on ArcFace latent feature space (d_cos < 0.35 rej
 """
 
 from __future__ import annotations
-from typing import List, Optional
+from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 
@@ -78,3 +78,35 @@ class DualLayerDeduplicator:
         if embedding is not None:
             self.registered_embeddings.append(embedding.copy())
         return False
+
+    def check_and_register(
+        self,
+        face_bgr_or_gray: np.ndarray,
+        embedding: Optional[np.ndarray] = None,
+    ) -> Tuple[bool, str, int]:
+        """
+        Computes 64-bit DCT pHash from a face image, checks dual-layer deduplication,
+        and registers if unique. Returns (is_duplicate, reason, phash_uint64).
+        """
+        gray = (
+            cv2.cvtColor(face_bgr_or_gray, cv2.COLOR_BGR2GRAY)
+            if face_bgr_or_gray.ndim == 3
+            else face_bgr_or_gray
+        )
+        phash = compute_64bit_dct_phash(gray)
+        for registered_h in self.registered_hashes:
+            if hamming_distance_64bit(phash, registered_h) <= self.hamming_threshold:
+                return True, "PHASH_NEAR_DUPLICATE", phash
+
+        if embedding is not None and len(self.registered_embeddings) > 0:
+            emb_norm = embedding / (np.linalg.norm(embedding) + 1e-8)
+            for reg_emb in self.registered_embeddings:
+                reg_norm = reg_emb / (np.linalg.norm(reg_emb) + 1e-8)
+                if (1.0 - float(np.dot(emb_norm, reg_norm))) < self.cosine_threshold:
+                    return True, "EMBEDDING_IDENTITY_LEAKAGE", phash
+
+        self.registered_hashes.append(phash)
+        if embedding is not None:
+            self.registered_embeddings.append(embedding.copy())
+        return False, "UNIQUE", phash
+

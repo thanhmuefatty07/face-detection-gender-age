@@ -400,3 +400,115 @@ class TestSOTAEdgeCasesAndExport:
         )
         assert len(buf.getvalue()) > 1000
 
+    def test_reid_loss_does_not_cluster_demographic_cohorts_without_identity(self):
+        """When identity is absent or -1, UnifiedBiometricLoss must NOT fall back to age/gender cohort pseudo-labels."""
+        criterion = UnifiedBiometricLoss(weight_reid=0.15)
+        B = 4
+        reid_emb = torch.randn(B, 64, requires_grad=True)
+        preds = {
+            "age_probs": torch.softmax(torch.randn(B, 101), dim=-1),
+            "age_logits": torch.randn(B, 101),
+            "expected_age": torch.tensor([22.0, 22.0, 22.0, 22.0]),
+            "gender_logit": torch.randn(B),
+            "log_variance": torch.randn(B),
+            "reid_embedding": reid_emb,
+        }
+        targets = {
+            "ldl_101": torch.softmax(torch.randn(B, 101), dim=-1),
+            "age_continuous": torch.tensor([22.0, 22.0, 22.0, 22.0]),
+            "gender": torch.tensor([1.0, 1.0, 1.0, 1.0]),
+        }
+        total_loss, metrics = criterion(preds, targets)
+        assert metrics["loss_reid"] == 0.0
+        total_loss.backward()
+        assert reid_emb.grad is None or torch.all(reid_emb.grad == 0.0)
+
+    def test_age_mask_zeros_invalid_age_gradients(self):
+        """Samples with age_mask == 0.0 must receive zero gradient from all age loss heads."""
+        criterion = UnifiedBiometricLoss(weight_interval=0.25)
+        B = 2
+        age_logits = torch.randn(B, 101, requires_grad=True)
+        age_probs = torch.softmax(age_logits, dim=-1)
+        expected_age = torch.sum(age_probs * torch.arange(101, dtype=torch.float32), dim=-1)
+        gender_logits = torch.randn(B, requires_grad=True)
+        log_var = torch.randn(B, requires_grad=True)
+
+        preds = {
+            "age_probs": age_probs,
+            "age_logits": age_logits,
+            "expected_age": expected_age,
+            "gender_logit": gender_logits,
+            "log_variance": log_var,
+        }
+        targets = {
+            "ldl_101": torch.softmax(torch.randn(B, 101), dim=-1),
+            "age_continuous": torch.tensor([30.0, 25.0]),
+            "age_min": torch.tensor([28.0, 25.0]),
+            "age_max": torch.tensor([32.0, 25.0]),
+            "age_mask": torch.tensor([1.0, 0.0]),  # Second sample has invalid/missing age
+            "gender": torch.tensor([1.0, 0.0]),
+            "gender_mask": torch.tensor([1.0, 1.0]),
+            "dimorphism_weight": torch.tensor([1.0, 1.0]),
+        }
+        total_loss, _ = criterion(preds, targets)
+        total_loss.backward()
+        assert age_logits.grad is not None
+        assert torch.all(age_logits.grad[1] == 0.0)
+        assert not torch.all(age_logits.grad[0] == 0.0)
+        assert log_var.grad is not None
+        assert log_var.grad[1].item() == 0.0
+        assert log_var.grad[0].item() != 0.0
+
+    @pytest.mark.parametrize("use_coupled_laplace", [False, True])
+    def test_heterogeneous_alpha_sample_weight_zeros_untrusted_sample_gradients(self, use_coupled_laplace):
+        """Per-sample alpha_sample_weight == 0.0 must zero out all gradients for that specific sample."""
+        criterion = UnifiedBiometricLoss(
+            weight_interval=0.25,
+            weight_reid=0.15,
+            use_coupled_laplace=use_coupled_laplace,
+        )
+        B = 6
+        age_logits = torch.randn(B, 101, requires_grad=True)
+        age_probs = torch.softmax(age_logits, dim=-1)
+        expected_age = torch.sum(age_probs * torch.arange(101, dtype=torch.float32), dim=-1)
+        gender_logits = torch.randn(B, requires_grad=True)
+        log_var = torch.randn(B, requires_grad=True)
+        reid_emb = torch.randn(B, 64, requires_grad=True)
+
+        preds = {
+            "age_probs": age_probs,
+            "age_logits": age_logits,
+            "expected_age": expected_age,
+            "gender_logit": gender_logits,
+            "log_variance": log_var,
+            "reid_embedding": reid_emb,
+        }
+        targets = {
+            "ldl_101": torch.softmax(torch.randn(B, 101), dim=-1),
+            "age_continuous": torch.tensor([25.0, 45.0, 25.0, 35.0, 35.0, 45.0]),
+            "age_min": torch.tensor([23.0, 43.0, 23.0, 33.0, 33.0, 43.0]),
+            "age_max": torch.tensor([27.0, 47.0, 27.0, 37.0, 37.0, 47.0]),
+            "age_mask": torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0, 1.0]),
+            "gender": torch.tensor([1.0, 0.0, 1.0, 0.0, 0.0, 1.0]),
+            "gender_mask": torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0, 1.0]),
+            "dimorphism_weight": torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0, 1.0]),
+            "identity": torch.tensor([7, 8, 7, 9, 9, 8]),
+            "alpha_sample_weight": torch.tensor([1.0, 0.0, 1.0, 1.0, 1.0, 0.0]),  # Samples 1 and 5 have 0 confidence
+        }
+
+        total_loss, _ = criterion(preds, targets)
+        total_loss.backward()
+
+        for idx_zero in (1, 5):
+            assert torch.all(age_logits.grad[idx_zero] == 0.0)
+            assert gender_logits.grad[idx_zero].item() == 0.0
+            assert log_var.grad[idx_zero].item() == 0.0
+            assert torch.all(reid_emb.grad[idx_zero] == 0.0)
+        for idx_active in (0, 2, 3, 4):
+            assert not torch.all(age_logits.grad[idx_active] == 0.0)
+            assert gender_logits.grad[idx_active].item() != 0.0
+            assert log_var.grad[idx_active].item() != 0.0
+            assert not torch.all(reid_emb.grad[idx_active] == 0.0)
+
+
+

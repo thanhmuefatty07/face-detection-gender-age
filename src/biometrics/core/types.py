@@ -109,6 +109,12 @@ class FaceAuditResult:
     yaw: float = 0.0
     pitch: float = 0.0
     roll: float = 0.0
+    shannon_entropy: float = 0.0
+    michelson_contrast: float = 0.0
+    cheek_microtexture_std: float = 0.0
+    skin_tone_ita_deg: float = 0.0
+    skin_tone_group: str = "Type_III_Intermediate"
+
 
 
 @dataclass
@@ -134,3 +140,30 @@ class BiometricPrediction:
     # Meta
     aligned_face_phash: Optional[int] = None
     embedding_512d: Optional[np.ndarray] = None
+
+    # Fine-grained 3-5 year age interval estimation (23 brackets across [0, 100])
+    age_interval_name: str = ""
+    age_interval_index: int = -1
+    age_interval_bounds: Tuple[int, int] = (0, 2)
+    age_interval_confidence: float = 0.0
+    age_interval_probs: Optional[np.ndarray] = None
+
+    def __post_init__(self) -> None:
+        from ..estimation.intervals import (
+            get_fine_interval_for_age,
+            integrate_101_to_fine_intervals,
+        )
+        if not self.age_interval_name or self.age_interval_index < 0:
+            name, idx, low, high = get_fine_interval_for_age(self.expected_age)
+            self.age_interval_name = name
+            self.age_interval_index = idx
+            self.age_interval_bounds = (low, high)
+        if (
+            self.age_interval_probs is None
+            and isinstance(self.age_ldl_distribution, np.ndarray)
+            and self.age_ldl_distribution.shape == (101,)
+        ):
+            self.age_interval_probs = integrate_101_to_fine_intervals(self.age_ldl_distribution)
+            if self.age_interval_confidence <= 0.0 and 0 <= self.age_interval_index < len(self.age_interval_probs):
+                self.age_interval_confidence = round(float(self.age_interval_probs[self.age_interval_index]), 4)
+

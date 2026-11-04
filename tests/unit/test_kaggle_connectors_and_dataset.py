@@ -13,11 +13,21 @@ Validates:
 """
 
 from __future__ import annotations
+import ast
 import io
+import json
 import math
+import os
+import re
+import shutil
 import tarfile
 import zipfile
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from collections import namedtuple
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Dict, Generator, List, Optional, Tuple
 import cv2
 import numpy as np
 import pandas as pd
@@ -27,6 +37,7 @@ from torch.utils.data import DataLoader
 
 from scripts.kaggle_pipeline.kaggle_dataset_connectors import (
     RawImageSample,
+    FairFaceConnector,
     UTKFaceConnector,
     AgeDBConnector,
     MorphConnector,
@@ -37,6 +48,7 @@ from scripts.kaggle_pipeline.kaggle_dataset_connectors import (
     DiskQuotaManager,
     ensure_master_manifest
 )
+from scripts.kaggle_pipeline import kaggle_dataset_connectors
 from scripts.kaggle_pipeline.kaggle_face_engine import (
     FacialLandmarkDetector,
     FaceGeometryAligner,
@@ -46,6 +58,8 @@ from scripts.kaggle_pipeline.kaggle_face_engine import (
 from src.biometrics.core.geometry import ARCFACE_CANONICAL_160, estimate_head_pose_pnp
 from src.biometrics.estimation.dataset import FaceGoldenDataset
 
+_DiskUsage = namedtuple("_DiskUsage", "total used free")
+
 
 def _make_dummy_image_bytes() -> bytes:
     img = np.full((160, 160, 3), 128, dtype=np.uint8)
@@ -54,8 +68,193 @@ def _make_dummy_image_bytes() -> bytes:
     return buf.tobytes()
 
 
+def _generated_notebook_quota_manager(tmp_path):
+    from scripts.kaggle_pipeline.build_kaggle_kernel import generate_pipeline_notebook
+
+    notebook_path = tmp_path / "generated_pipeline.ipynb"
+    generate_pipeline_notebook(notebook_path)
+    notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
+    class_node = None
+    for cell in notebook["cells"]:
+        if cell["cell_type"] != "code":
+            continue
+        tree = ast.parse("".join(cell["source"]))
+        class_node = next(
+            (node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "DiskQuotaManager"),
+            None,
+        )
+        if class_node is not None:
+            break
+    assert class_node is not None
+
+    namespace = {
+        "Path": Path,
+        "io": io,
+        "pd": pd,
+        "shutil": SimpleNamespace(disk_usage=lambda _path: _DiskUsage(10_000_000, 1_000_000, 9_000_000)),
+        "tarfile": tarfile,
+    }
+    generated_class = ast.Module(body=[class_node], type_ignores=[])
+    exec(compile(ast.fix_missing_locations(generated_class), "generated_notebook_quota.py", "exec"), namespace)
+    return namespace["DiskQuotaManager"], namespace["shutil"]
+
+
+def _new_quota_manager(tmp_path, generated, disk_usage, monkeypatch, max_storage_gb=18.0):
+    def disk_usage_result(path):
+        result = disk_usage(path)
+        return result if hasattr(result, "used") else _DiskUsage(*result)
+
+    if generated:
+        manager_type, disk_api = _generated_notebook_quota_manager(tmp_path)
+        disk_api.disk_usage = disk_usage_result
+        manager = manager_type(
+            target_dir=str(tmp_path / "generated_output"),
+            max_storage_gb=max_storage_gb,
+            min_free_gb=0,
+        )
+        return manager, disk_api
+
+    from scripts.kaggle_pipeline import kaggle_dataset_connectors
+
+    disk_api = kaggle_dataset_connectors.shutil
+    monkeypatch.setattr(disk_api, "disk_usage", disk_usage_result)
+    manager = DiskQuotaManager(
+        working_dir=str(tmp_path / "module_output"),
+        max_storage_gb=max_storage_gb,
+        min_free_gb=0,
+    )
+    return manager, disk_api
+
+
 class TestKaggleConnectors:
     """Verifies all 7 verified ground-truth dataset connectors."""
+
+    @pytest.mark.parametrize(
+        "connector_cls,csv_name,image_column,labels",
+        [
+            (FairFaceConnector, "fairface_label_train.csv", "file", {"age": "20-29", "gender": "Female", "race": "White"}),
+            (B3FDConnector, "labels.csv", "image_name", {"age": 30, "gender": "Male"}),
+            (AppaRealConnector, "labels_train.csv", "file_name", {"real_age": 30, "apparent_age_avg": 30, "apparent_age_std": 1}),
+        ],
+    )
+    @pytest.mark.parametrize("use_absolute_path", [False, True])
+    def test_csv_connectors_reject_metadata_paths_outside_dataset_root(
+        self, tmp_path, connector_cls, csv_name, image_column, labels, use_absolute_path
+    ):
+        dataset_root = tmp_path / "dataset"
+        dataset_root.mkdir()
+        outside_image = tmp_path / "outside.jpg"
+        outside_image.write_bytes(_make_dummy_image_bytes())
+        (dataset_root / "outside.jpg").write_bytes(_make_dummy_image_bytes())
+        metadata_path = str(outside_image) if use_absolute_path else "../outside.jpg"
+        row = {image_column: metadata_path, **labels}
+        pd.DataFrame([row]).to_csv(dataset_root / csv_name, index=False)
+
+        assert list(connector_cls(dataset_root).stream_samples()) == []
+
+    def test_fairface_accepts_image_path_inside_dataset_root(self, tmp_path):
+        dataset_root = tmp_path / "dataset"
+        (dataset_root / "train").mkdir(parents=True)
+        (dataset_root / "train" / "inside.jpg").write_bytes(_make_dummy_image_bytes())
+        pd.DataFrame([{
+            "file": "train/inside.jpg",
+            "age": "20-29",
+            "gender": "Female",
+            "race": "White",
+        }]).to_csv(dataset_root / "fairface_label_train.csv", index=False)
+
+        samples = list(FairFaceConnector(dataset_root).stream_samples())
+
+        assert len(samples) == 1
+        assert samples[0].raw_id == "inside.jpg"
+
+    @pytest.mark.parametrize("storage", ["path", "tar", "zip"])
+    def test_utkface_skips_image_bytes_over_configured_limit(self, tmp_path, monkeypatch, storage):
+        dataset_root = tmp_path / "dataset"
+        dataset_root.mkdir()
+        member_name = "25_1_0_large.jpg"
+        payload = b"x" * 9
+        if storage == "path":
+            (dataset_root / member_name).write_bytes(payload)
+        elif storage == "tar":
+            with tarfile.open(dataset_root / "images.tar", "w") as archive:
+                member = tarfile.TarInfo(member_name)
+                member.size = len(payload)
+                archive.addfile(member, io.BytesIO(payload))
+        else:
+            with zipfile.ZipFile(dataset_root / "images.zip", "w") as archive:
+                archive.writestr(member_name, payload)
+
+        connector = UTKFaceConnector(dataset_root)
+        monkeypatch.setattr(connector, "MAX_ENCODED_IMAGE_BYTES", 8, raising=False)
+
+        assert list(connector.stream_samples()) == []
+
+    def test_image_decoder_rejects_excessive_pixel_dimensions_before_opencv_decode(self, monkeypatch):
+        from PIL import Image
+
+        class Header:
+            width = 5001
+            height = 5000
+            size = (width, height)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        monkeypatch.setattr(kaggle_dataset_connectors, "Image", Image, raising=False)
+        monkeypatch.setattr(Image, "open", lambda _buffer: Header())
+        monkeypatch.setattr(
+            kaggle_dataset_connectors.cv2,
+            "imdecode",
+            lambda *_args: pytest.fail("OpenCV must not decode over-budget dimensions"),
+        )
+
+        sample = RawImageSample(image_bytes=b"header", source_dataset="synthetic", raw_id="oversized.jpg")
+
+        assert sample.to_bgr_image() is None
+
+    def test_generated_kaggle_connectors_keep_path_and_archive_bounds(self, tmp_path, monkeypatch):
+        from scripts.kaggle_pipeline.build_kaggle_kernel import generate_pipeline_notebook
+
+        notebook_path = tmp_path / "generated_pipeline.ipynb"
+        generate_pipeline_notebook(notebook_path)
+        notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
+        connector_source = "".join(notebook["cells"][2]["source"])
+        assert ".read()" not in connector_source
+        assert "read_tar_member" in connector_source
+        assert "read_zip_member" in connector_source
+        assert "resolve_under_root" in connector_source
+
+        namespace = {
+            "os": os, "Path": Path, "ABC": ABC, "abstractmethod": abstractmethod,
+            "dataclass": dataclass, "Generator": Generator, "Dict": Dict, "Any": Any,
+            "List": List, "Optional": Optional, "Tuple": Tuple,
+            "np": np, "pd": pd, "cv2": cv2, "Image": kaggle_dataset_connectors.Image,
+        }
+        exec(compile(connector_source, "generated_kaggle_connectors.py", "exec"), namespace)
+
+        root = tmp_path / "generated_utkface"
+        root.mkdir()
+        with zipfile.ZipFile(root / "images.zip", "w") as archive:
+            archive.writestr("25_1_0_large.jpg", b"x" * 9)
+        connector = namespace["UTKFaceConnector"](root)
+        monkeypatch.setattr(connector, "MAX_ENCODED_IMAGE_BYTES", 8)
+        assert list(connector.stream_samples()) == []
+
+        appa_root = tmp_path / "generated_appa"
+        appa_root.mkdir()
+        (tmp_path / "outside.jpg").write_bytes(_make_dummy_image_bytes())
+        (appa_root / "outside.jpg").write_bytes(_make_dummy_image_bytes())
+        pd.DataFrame([{
+            "file_name": "../outside.jpg",
+            "real_age": 30,
+            "apparent_age_avg": 30,
+            "apparent_age_std": 1,
+        }]).to_csv(appa_root / "labels_train.csv", index=False)
+        assert list(namespace["AppaRealConnector"](appa_root).stream_samples()) == []
 
     def test_utkface_connector(self, tmp_path):
         """Validates UTKFace filename parsing: age, gender, race."""
@@ -677,6 +876,68 @@ class TestForensicAuditFixes:
             names = tf.getnames()
             assert "face_direct.jpg" in names
 
+    @pytest.mark.parametrize("generated", [False, True], ids=["connector-module", "generated-notebook"])
+    def test_quota_manager_reports_baseline_measurement_failure(self, tmp_path, monkeypatch, generated):
+        def unavailable(_path):
+            raise OSError("synthetic disk usage failure")
+
+        with pytest.raises(RuntimeError, match="DISK_USAGE_UNAVAILABLE"):
+            _new_quota_manager(tmp_path, generated, unavailable, monkeypatch)
+
+    @pytest.mark.parametrize("generated", [False, True], ids=["connector-module", "generated-notebook"])
+    def test_quota_manager_refuses_writes_when_disk_usage_fails(self, tmp_path, monkeypatch, generated):
+        manager, disk_api = _new_quota_manager(
+            tmp_path,
+            generated,
+            lambda _path: (10_000_000, 1_000_000, 9_000_000),
+            monkeypatch,
+        )
+
+        def unavailable(_path):
+            raise OSError("synthetic disk usage failure")
+
+        monkeypatch.setattr(disk_api, "disk_usage", unavailable)
+        try:
+            assert manager.write_aligned_face(None, "candidate.jpg", image_bytes=b"face") is False
+            assert manager.current_shard_count == 0
+        finally:
+            manager.close()
+
+    @pytest.mark.parametrize("generated", [False, True], ids=["connector-module", "generated-notebook"])
+    def test_quota_manager_stops_when_run_storage_budget_is_exceeded(self, tmp_path, monkeypatch, generated):
+        usage = iter([
+            (10_000_000, 1_000_000, 9_000_000),
+            (10_000_000, 2_500_000, 7_500_000),
+        ])
+        manager, _ = _new_quota_manager(
+            tmp_path,
+            generated,
+            lambda _path: next(usage, (10_000_000, 2_500_000, 7_500_000)),
+            monkeypatch,
+            max_storage_gb=0.001,
+        )
+        try:
+            assert manager.write_aligned_face(None, "candidate.jpg", image_bytes=b"face") is False
+            assert manager.current_shard_count == 0
+        finally:
+            manager.close()
+
+    @pytest.mark.parametrize("generated", [False, True], ids=["connector-module", "generated-notebook"])
+    def test_quota_manager_checks_projected_tar_size_before_write(self, tmp_path, monkeypatch, generated):
+        usage = lambda _path: (10_000_000, 1_000_000, 9_000_000)
+        manager, _ = _new_quota_manager(
+            tmp_path,
+            generated,
+            usage,
+            monkeypatch,
+            max_storage_gb=0.001,
+        )
+        try:
+            assert manager.write_aligned_face(None, "candidate.jpg", image_bytes=b"x" * 1_100_000) is False
+            assert manager.current_shard_count == 0
+        finally:
+            manager.close()
+
     def test_preflight_smoke_test_guard_on_empty_mounts(self, tmp_path):
         """
         Critical Fix D.2: Pre-flight smoke test MUST raise RuntimeError immediately
@@ -714,6 +975,25 @@ class TestForensicAuditFixes:
         loaded_parquet = pd.read_parquet(golden_dir / "metadata.parquet")
         assert len(loaded_parquet) == 3
         assert set(loaded_parquet["image_id"]) == {"face_1.jpg", "face_2.jpg", "face_3.jpg"}
+
+    def test_manifest_csv_escapes_formula_text_without_changing_parquet(self, tmp_path):
+        golden_dir = tmp_path / "formula_manifest"
+        shards_dir = golden_dir / "shards"
+        shards_dir.mkdir(parents=True)
+        original = "\t=HYPERLINK(\"https://example.invalid\")"
+        pd.DataFrame([{
+            "image_id": "face_1.jpg",
+            "sha256": "hash1",
+            "source_dataset": "+SUM(1,1)",
+            "original_filename": original,
+        }]).to_parquet(shards_dir / "shard_0000_manifest.parquet")
+
+        ensure_master_manifest(golden_dir)
+
+        assert original in pd.read_parquet(golden_dir / "metadata.parquet").loc[0, "original_filename"]
+        csv_text = (golden_dir / "metadata.csv").read_text(encoding="utf-8")
+        assert "'\t=HYPERLINK" in csv_text
+        assert "'+SUM(1,1)" in csv_text
 
     def test_face_golden_dataset_persistent_tar_handles(self, tmp_path):
         """Validates persistent TarFile handle caching in FaceGoldenDataset for high throughput."""

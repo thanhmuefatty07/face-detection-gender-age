@@ -34,11 +34,79 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
 
 
+BANNED_NON_REAL_SOURCE_PATTERNS: Tuple[str, ...] = (
+    "utkface",
+    "utk_face",
+    "utk-face",
+    "synface",
+    "digiface",
+    "sfhq",
+    "stylegan",
+    "progan",
+    "thispersondoesnotexist",
+    "tpdne",
+    "dcface",
+    "idiff-face",
+    "idiffface",
+    "gandiff",
+    "stable_diffusion",
+    "stablediffusion",
+    "midjourney",
+    "dalle",
+    "dall-e",
+    "ai_generated",
+    "aigenerated",
+    "ai-generated",
+    "synthetic_face",
+    "fake_face",
+    "fakeface",
+    "deepfake",
+    "faceforensics_manipulated",
+    "dfdc_fake",
+    "cartoon",
+    "anime",
+    "manga",
+    "sketch",
+    "cufs",
+    "cufsf",
+    "caricature",
+    "iiit_cfw",
+    "illustration",
+    "painting",
+    "drawing",
+    "watercolor",
+    "oil_painting",
+    "statue",
+    "sculpture",
+    "mannequin",
+    "wax_figure",
+    "doll",
+    "3d_render",
+    "cgi_face",
+    "metahuman",
+    "bitmoji",
+    "avatar",
+)
+
+
+def is_banned_non_real_source(name_or_path: Optional[str]) -> bool:
+    """Returns True if a query, title, URL, or path matches any banned non-real pattern."""
+    if not name_or_path:
+        return False
+    norm = urllib.parse.unquote(str(name_or_path)).strip().lower().replace("\\", "/")
+    return any(pat in norm for pat in BANNED_NON_REAL_SOURCE_PATTERNS)
+
+
 class InCloudDemographicCrawler:
     """
     Resilient multi-threaded demographic face crawler querying Wikimedia Commons.
     Covers the full 220-demographic matrix to eliminate demographic blind spots.
     """
+
+    NEGATIVE_SEARCH_EXCLUSIONS = (
+        "-cartoon -sketch -drawing -painting -statue -sculpture "
+        "-illustration -anime -avatar -caricature -mannequin -doll -synthetic -cgi"
+    )
 
     DEMOGRAPHIC_MATRICES = {
         "ethnicities": [
@@ -153,21 +221,24 @@ class InCloudDemographicCrawler:
 
     def query_wikimedia_commons(self, query: str, limit: int = 20) -> List[str]:
         """
-        Queries Wikimedia Commons open public domain API for high-resolution faces.
-        Returns a list of image URLs.
+        Queries Wikimedia Commons open public domain API for high-resolution real human faces.
+        Excludes non-real, synthetic, cartoon, sketch, painting, statue, sculpture, and mannequin media.
+        Returns a list of vetted image URLs.
         """
         image_urls = []
-        if not query:
+        if not query or is_banned_non_real_source(query):
             return image_urls
         try:
             endpoint = "https://commons.wikimedia.org/w/api.php"
             params = {
                 "action": "query",
                 "generator": "search",
-                "gsrsearch": f"{query} face portrait filetype:bitmap",
+                "gsrsearch": f"{query} face portrait filetype:bitmap {self.NEGATIVE_SEARCH_EXCLUSIONS}",
+                "gsrnamespace": 6,
                 "gsrlimit": min(limit, 50),
                 "prop": "imageinfo",
                 "iiprop": "url|mime",
+                "iiurlwidth": 512,
                 "format": "json"
             }
             url = f"{endpoint}?{urllib.parse.urlencode(params)}"
@@ -176,11 +247,20 @@ class InCloudDemographicCrawler:
                 data = json.loads(data_bytes.decode('utf-8'))
                 pages = data.get("query", {}).get("pages", {})
                 for page_id, info in pages.items():
+                    title = str(info.get("title", ""))
+                    if is_banned_non_real_source(title):
+                        continue
                     imageinfo = info.get("imageinfo", [])
                     if imageinfo:
-                        img_url = imageinfo[0].get("url")
+                        img_url = imageinfo[0].get("thumburl") or imageinfo[0].get("url")
+                        orig_url = imageinfo[0].get("url", "")
                         mime = imageinfo[0].get("mime", "")
-                        if img_url and any(ext in mime for ext in ["jpeg", "png", "webp"]):
+                        if (
+                            img_url
+                            and not is_banned_non_real_source(img_url)
+                            and not is_banned_non_real_source(orig_url)
+                            and any(ext in mime for ext in ["jpeg", "png", "webp"])
+                        ):
                             image_urls.append(img_url)
         except Exception as e:
             logger.debug(f"Wikimedia API query error: {e}")
@@ -188,14 +268,16 @@ class InCloudDemographicCrawler:
 
     def download_url(self, item: Dict[str, str]) -> bool:
         """
-        Downloads a single image URL with timeout and error handling.
-        Returns False on unreachable or malformed URLs without unhandled exceptions.
+        Downloads a single image URL with timeout, non-real URL/filename blocking, and error handling.
+        Returns False on unreachable, banned non-real, or malformed URLs without unhandled exceptions.
         """
         if not isinstance(item, dict) or 'url' not in item or 'dest' not in item:
             return False
         url = item['url']
         dest_path = item['dest']
         if not url.startswith('http://') and not url.startswith('https://'):
+            return False
+        if is_banned_non_real_source(url) or is_banned_non_real_source(Path(dest_path).name):
             return False
 
         try:

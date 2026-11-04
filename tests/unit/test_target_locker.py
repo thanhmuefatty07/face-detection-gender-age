@@ -135,3 +135,76 @@ class TestTargetLocker:
         assert res["locked_gender"] == "Female"
         # Gender log-odds leaked naturally: 3.0 * (0.95^5) ~ 2.32
         assert pytest.approx(res["log_odds"], rel=1e-2) == 3.0 * (0.95 ** 5)
+
+    def test_huber_kalman_outlier_gating(self):
+        """Verifies Huber-Kalman innovation gating suppresses an extreme 50-year spike even when aleatoric_std is small."""
+        kf = EpistemicAgeKalmanFilter(initial_age=25.0, initial_std=1.0, huber_delta=5.0)
+        # Without Huber gating, measured_age=85.0 with aleatoric_std=1.0 would pull age to ~55.0!
+        smoothed = kf.update(measured_age=85.0, aleatoric_std=1.0)
+        assert abs(smoothed - 25.0) < 6.0
+
+    def test_23_bracket_hysteresis_deadband_prevents_boundary_oscillation(self):
+        """Verifies that slight age oscillations across the 25.5 boundary ('22-25' vs '26-30') do not flicker brackets."""
+        locker = TargetLocker(interval_hysteresis_margin=0.35)
+        res0 = locker.update(track_id=7, age_pred=25.3, aleatoric_std=0.2, gender_logit=1.0)
+        assert res0["locked_age_interval"] == "22-25"
+
+        # Slightly cross 25.5 to 25.65 (within 25.5 + 0.35 = 25.85 hysteresis retention band)
+        res1 = locker.update(track_id=7, age_pred=25.7, aleatoric_std=0.1, gender_logit=1.0)
+        assert 25.5 < res1["locked_age"] <= 25.85
+        assert res1["locked_age_interval"] == "22-25"
+
+        # Penetrate well past 25.85 (e.g. 27.5) -> transitions cleanly to '26-30'
+        res2 = locker.update(track_id=7, age_pred=28.0, aleatoric_std=0.1, gender_logit=1.0)
+        assert res2["locked_age_interval"] == "26-30"
+
+    def test_first_real_measurement_after_unmeasured_creation_anchors_immediately(self):
+        """Verifies a track created with has_measurement=False anchors to its first real measurement instead of rejecting it via Huber gating."""
+        locker = TargetLocker()
+        # Frame 1: Track created before first crop inference completes
+        res_unmeasured = locker.update(track_id=99, has_measurement=False)
+        assert res_unmeasured["locked_age"] == 25.0
+
+        # Frame 2: First real measurement arrives for a 72yo subject
+        res_measured = locker.update(
+            track_id=99,
+            age_pred=72.0,
+            aleatoric_std=1.0,
+            gender_logit=2.5,
+            has_measurement=True,
+        )
+        assert pytest.approx(res_measured["locked_age"], abs=1e-3) == 72.0
+        assert res_measured["locked_age_interval"] == "71-75"
+        assert res_measured["locked_gender"] == "Female"
+        assert pytest.approx(res_measured["log_odds"], abs=1e-3) == 2.5
+
+    def test_nan_and_inf_measurements_coast_safely_without_poisoning(self):
+        """Verifies NaN or Inf inputs do not poison Kalman state or crash interval lookup."""
+        locker = TargetLocker()
+        locker.update(track_id=5, age_pred=42.0, aleatoric_std=1.0, gender_logit=-2.0)
+
+        res_nan = locker.update(
+            track_id=5,
+            age_pred=float("nan"),
+            aleatoric_std=float("inf"),
+            gender_logit=float("nan"),
+            has_measurement=True,
+        )
+        assert pytest.approx(res_nan["locked_age"], abs=1e-3) == 42.0
+        assert res_nan["locked_age_interval"] == "41-45"
+        assert res_nan["locked_gender"] == "Male"
+
+    def test_high_uncertainty_ood_crop_attenuates_gender_flip(self):
+        """Verifies high aleatoric/total uncertainty (>2.0) attenuates gender logit updates to prevent OOD flips."""
+        locker = TargetLocker()
+        for _ in range(2):
+            res = locker.update(track_id=11, age_pred=30.0, aleatoric_std=1.0, gender_logit=1.5)
+        assert res["locked_gender"] == "Female"
+
+        # Two consecutive high-uncertainty OOD / occluded crops (std=10.0) with strong opposite logit (-4.0)
+        for _ in range(2):
+            res = locker.update(track_id=11, age_pred=75.0, aleatoric_std=10.0, gender_logit=-4.0)
+        assert res["locked_gender"] == "Female"
+        assert res["log_odds"] > 1.5
+
+

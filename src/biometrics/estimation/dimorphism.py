@@ -16,6 +16,13 @@ import math
 from typing import Tuple, Dict
 
 
+from .intervals import (
+    FINE_AGE_INTERVALS,
+    NUM_FINE_AGE_INTERVALS,
+    get_fine_interval_for_age,
+    map_bounds_to_fine_interval,
+)
+
 AGE_COHORTS = [
     ('0-2', 0, 2),
     ('3-6', 3, 6),
@@ -32,11 +39,15 @@ AGE_COHORTS = [
 
 def get_cohort_for_age(age: float) -> Tuple[str, int]:
     """Returns (cohort_name, cohort_index) for continuous age in [0, 100]."""
-    age_int = int(round(age))
+    if math.isnan(float(age)) or math.isinf(float(age)):
+        return ('25-34', 5)
+    age_clamped = max(0.0, min(100.0, float(age)))
+    age_int = int(math.floor(age_clamped + 0.5))
     for idx, (name, low, high) in enumerate(AGE_COHORTS):
         if low <= age_int <= high:
             return name, idx
     return ('65+', 9)
+
 
 
 def calculate_sexual_dimorphism_weight(age: float) -> float:

@@ -13,6 +13,7 @@ import cv2
 import numpy as np
 import torch
 
+from src.biometrics.core.geometry import UmeyamaAligner
 from src.biometrics.estimation.backbone import BiometricMultiTaskModel
 from src.biometrics.tracking.byte_tracker import ByteTracker, Detection
 from src.biometrics.tracking.target_locker import TargetLocker
@@ -28,7 +29,7 @@ class EdgeAsyncPipeline:
     """
     Local edge standalone biometric estimation and multi-target locking pipeline.
     Seamlessly integrates OpenVINO iGPU/CPU acceleration, YuNet detection,
-    and Epistemic Target Locking.
+    5-point Umeyama affine alignment, and Epistemic Target Locking.
     """
 
     def __init__(
@@ -38,14 +39,27 @@ class EdgeAsyncPipeline:
         use_openvino: bool = False,
         device: str = "cpu",
         yunet_model_path: Optional[str | Path] = None,
+        enable_flip_tta: bool = True,
+        checkpoint_path: Optional[str | Path] = None,
+        target_size: int = 160,
     ):
         self.backbone_name = backbone_name
         self.max_targets = max_targets
         self.device = device
         self.use_openvino = use_openvino
+        self.enable_flip_tta = enable_flip_tta
+        self.target_size = int(target_size)
 
         # 1. Initialize local PyTorch model
         self.model = BiometricMultiTaskModel(backbone_name=backbone_name, pretrained=False)
+        if checkpoint_path is None and backbone_name == "convnextv2_tiny":
+            default_ckpt = Path(__file__).resolve().parent.parent.parent.parent / "models" / "convnextv2_tiny_biometrics.pt"
+            if default_ckpt.exists():
+                checkpoint_path = default_ckpt
+        if checkpoint_path is not None and Path(checkpoint_path).exists():
+            ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+            state_dict = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
+            self.model.load_state_dict(state_dict, strict=False)
         self.model.to(self.device)
         self.model.eval()
 
@@ -55,7 +69,7 @@ class EdgeAsyncPipeline:
         if self.use_openvino and ov is not None:
             self._init_openvino(target_device=device)
 
-        # 3. YuNet Face Detector
+        # 3. YuNet Face Detector & 5-Point Umeyama Aligner
         if yunet_model_path is None:
             default_p = Path(__file__).resolve().parent.parent.parent.parent / "models" / "face_detection_yunet_2023mar.onnx"
             if default_p.exists():
@@ -64,6 +78,7 @@ class EdgeAsyncPipeline:
                 yunet_model_path = "models/face_detection_yunet_2023mar.onnx"
 
         self.detector = YuNetFaceDetector(model_path=yunet_model_path, confidence_threshold=0.5)
+        self.aligner = UmeyamaAligner(target_size=self.target_size)
 
         # 4. Multi-target tracker and Epistemic Locker
         self.tracker = ByteTracker(max_targets=max_targets)
@@ -78,10 +93,10 @@ class EdgeAsyncPipeline:
             if ov_dev not in available:
                 ov_dev = "GPU" if "GPU" in available else "CPU"
 
-            dummy = torch.zeros(1, 3, 160, 160)
+            dummy = torch.zeros(1, 3, self.target_size, self.target_size, device=self.device)
             ov_model = ov.convert_model(self.model, example_input=dummy)
             # Make batch dimension dynamic
-            ov_model.inputs[0].get_node().set_partial_shape(ov.PartialShape([-1, 3, 160, 160]))
+            ov_model.inputs[0].get_node().set_partial_shape(ov.PartialShape([-1, 3, self.target_size, self.target_size]))
             ov_model.validate_nodes_and_infer_types()
 
             compiled = core.compile_model(ov_model, ov_dev)
@@ -94,8 +109,10 @@ class EdgeAsyncPipeline:
     def detect_faces(self, frame: np.ndarray) -> List[Dict[str, Any]]:
         """
         Detects faces in frame using YuNet with fallback.
-        Returns list of {'bbox': (x1, y1, x2, y2), 'score': float}.
+        Returns list of {'bbox': (x1, y1, x2, y2), 'score': float, 'landmarks': Optional[np.ndarray]}.
         """
+        if frame is None or frame.size == 0 or frame.ndim != 3:
+            return []
         H, W = frame.shape[:2]
         if H < 20 or W < 20:
             return []
@@ -107,9 +124,11 @@ class EdgeAsyncPipeline:
             y1 = float(d.bbox.y)
             x2 = float(d.bbox.x + d.bbox.width)
             y2 = float(d.bbox.y + d.bbox.height)
+            lmks = d.landmarks.points if getattr(d, "landmarks", None) is not None else None
             results.append({
                 "bbox": (x1, y1, x2, y2),
                 "score": float(d.bbox.confidence),
+                "landmarks": lmks,
             })
         return results
 
@@ -120,27 +139,97 @@ class EdgeAsyncPipeline:
             return [], [], [], []
 
         batch_arr = np.stack(crops, axis=0).transpose(0, 3, 1, 2)
-        batch_float = batch_arr.astype(np.float32) / 127.5 - 1.0
+        batch_float = np.ascontiguousarray(batch_arr.astype(np.float32) / 127.5 - 1.0)
 
         if self.ov_compiled_model is not None:
             try:
-                ov_out = self.ov_compiled_model(batch_float)
-                out_by_name = {port.any_name: arr for port, arr in ov_out.items()}
-                age_preds = out_by_name.get("expected_age", out_by_name.get("age_expected", np.zeros(N))).flatten().tolist()
-                std_preds = out_by_name.get("aleatoric_std", np.ones(N)).flatten().tolist()
-                g_logits = out_by_name.get("gender_logit", np.zeros(N)).flatten().tolist()
-                reid_embs = [out_by_name["reid_embedding"][i] for i in range(N)] if "reid_embedding" in out_by_name else [None] * N
-                return age_preds, std_preds, g_logits, reid_embs
+                if self.enable_flip_tta:
+                    batch_flip = np.ascontiguousarray(batch_float[:, :, :, ::-1])
+                    inp_ov = np.concatenate([batch_float, batch_flip], axis=0)
+                    ov_out = self.ov_compiled_model(inp_ov)
+                    vals = [np.asarray(v, dtype=np.float32) for v in ov_out.values()]
+                    logits_cat = vals[0]
+                    g_cat = vals[1].reshape(2 * N)
+                    lv_cat = np.clip(vals[2].reshape(2 * N), -6.0, 4.0)
+                    reid_cat = vals[3].reshape(2 * N, -1)
+
+                    logits_shift = logits_cat - np.max(logits_cat, axis=-1, keepdims=True)
+                    exp_l = np.exp(logits_shift)
+                    probs_cat = exp_l / np.clip(np.sum(exp_l, axis=-1, keepdims=True), 1e-12, None)
+                    bins_vec = np.arange(probs_cat.shape[-1], dtype=np.float32)
+                    expected_cat = np.sum(probs_cat * bins_vec[None, :], axis=-1)
+                    std_cat = np.exp(0.5 * lv_cat)
+
+                    probs_avg = 0.5 * (probs_cat[:N] + probs_cat[N:])
+                    probs_avg = probs_avg / np.clip(np.sum(probs_avg, axis=-1, keepdims=True), 1e-12, None)
+                    age_preds = np.sum(probs_avg * bins_vec[None, :], axis=-1).flatten().tolist()
+
+                    var_orig = std_cat[:N] ** 2
+                    var_flip = std_cat[N:] ** 2
+                    epistemic_age_diff = 0.5 * np.abs(expected_cat[:N] - expected_cat[N:])
+                    w_half = batch_float.shape[3] // 2
+                    if w_half > 0:
+                        left_h = batch_float[:, :, :, :w_half]
+                        right_h = batch_float[:, :, :, -w_half:][:, :, :, ::-1]
+                        hemiface_var_gap = np.abs(np.var(left_h, axis=(1, 2, 3)) - np.var(right_h, axis=(1, 2, 3)))
+                        bilateral_penalty = 0.50 * hemiface_var_gap
+                    else:
+                        bilateral_penalty = np.zeros_like(epistemic_age_diff)
+                    epistemic_std = np.sqrt(epistemic_age_diff ** 2 + bilateral_penalty ** 2)
+                    gender_dis = 0.05 * ((g_cat[:N] - g_cat[N:]) ** 2)
+                    total_var = 0.5 * (var_orig + var_flip) + (epistemic_std ** 2) + gender_dis
+                    std_preds = np.sqrt(np.clip(total_var, 1e-6, None)).flatten().tolist()
+
+                    g_logits = (0.5 * (g_cat[:N] + g_cat[N:])).flatten().tolist()
+                    reid_avg = 0.5 * (reid_cat[:N] + reid_cat[N:])
+                    reid_norm = reid_avg / np.clip(np.linalg.norm(reid_avg, axis=-1, keepdims=True), 1e-12, None)
+                    reid_embs = [reid_norm[i] for i in range(N)]
+                    return age_preds, std_preds, g_logits, reid_embs
+                else:
+                    ov_out = self.ov_compiled_model(batch_float)
+                    vals = [np.asarray(v, dtype=np.float32) for v in ov_out.values()]
+                    logits = vals[0]
+                    g_arr = vals[1].reshape(N)
+                    lv_arr = np.clip(vals[2].reshape(N), -6.0, 4.0)
+                    reid_arr = vals[3].reshape(N, -1)
+
+                    logits_shift = logits - np.max(logits, axis=-1, keepdims=True)
+                    exp_l = np.exp(logits_shift)
+                    probs = exp_l / np.clip(np.sum(exp_l, axis=-1, keepdims=True), 1e-12, None)
+                    bins_vec = np.arange(probs.shape[-1], dtype=np.float32)
+                    age_preds = np.sum(probs * bins_vec[None, :], axis=-1).flatten().tolist()
+                    std_preds = np.exp(0.5 * lv_arr).flatten().tolist()
+                    g_logits = g_arr.flatten().tolist()
+                    reid_norm = reid_arr / np.clip(np.linalg.norm(reid_arr, axis=-1, keepdims=True), 1e-12, None)
+                    reid_embs = [reid_norm[i] for i in range(N)]
+                    return age_preds, std_preds, g_logits, reid_embs
             except Exception:
                 pass
 
-        # PyTorch fallback
+        # PyTorch execution (with Flip-TTA via predict_smooth when available)
         tensor = torch.from_numpy(batch_float).to(self.device)
         with torch.no_grad():
-            out = self.model(tensor)
+            if hasattr(self.model, "predict_smooth"):
+                out = self.model.predict_smooth(tensor, enable_flip_tta=self.enable_flip_tta)
+            else:
+                out = self.model(tensor)
+
+        if isinstance(out, (tuple, list)):
+            age_logits, gender_logit, log_var, reid_t = out[0], out[1], out[2], out[3]
+            age_ldl_t = torch.softmax(age_logits, dim=-1)
+            bins_t = torch.arange(age_ldl_t.shape[-1], device=age_ldl_t.device, dtype=age_ldl_t.dtype)
+            exp_age_t = torch.sum(age_ldl_t * bins_t.unsqueeze(0), dim=-1).reshape(-1)
+            std_t = torch.exp(0.5 * torch.clamp(log_var.reshape(-1), -6.0, 4.0))
+            age_preds = exp_age_t.cpu().numpy().flatten().tolist()
+            std_preds = std_t.cpu().numpy().flatten().tolist()
+            g_logits = gender_logit.reshape(-1).cpu().numpy().flatten().tolist()
+            reid_arr = reid_t.cpu().numpy()
+            reid_embs = [reid_arr[i] for i in range(N)]
+            return age_preds, std_preds, g_logits, reid_embs
 
         age_preds = out["expected_age"].cpu().numpy().flatten().tolist()
-        std_preds = out["aleatoric_std"].cpu().numpy().flatten().tolist()
+        std_tensor = out.get("total_std", out["aleatoric_std"])
+        std_preds = std_tensor.cpu().numpy().flatten().tolist()
         g_logits = out["gender_logit"].cpu().numpy().flatten().tolist()
         reid_arr = out["reid_embedding"].cpu().numpy()
         reid_embs = [reid_arr[i] for i in range(N)]
@@ -157,6 +246,8 @@ class EdgeAsyncPipeline:
         Returns:
             List of locked biometric target dictionaries
         """
+        if frame is None or frame.size == 0 or frame.ndim != 3:
+            return []
         H, W = frame.shape[:2]
         raw_dets = self.detect_faces(frame)
 
@@ -164,6 +255,19 @@ class EdgeAsyncPipeline:
         valid_det_indices: List[int] = []
 
         for i, d in enumerate(raw_dets):
+            lmks = d.get("landmarks")
+            if lmks is not None:
+                try:
+                    lmks_arr = np.asarray(lmks, dtype=np.float32)
+                    if lmks_arr.shape == (5, 2) and np.all(np.isfinite(lmks_arr)):
+                        aligned_bgr = self.aligner.align(frame, lmks_arr)
+                        crop_rgb = cv2.cvtColor(aligned_bgr, cv2.COLOR_BGR2RGB)
+                        crops.append(crop_rgb)
+                        valid_det_indices.append(i)
+                        continue
+                except Exception:
+                    pass
+
             x1, y1, x2, y2 = [int(v) for v in d["bbox"]]
             x1 = max(0, x1)
             y1 = max(0, y1)
@@ -172,8 +276,8 @@ class EdgeAsyncPipeline:
             if x2 > x1 and y2 > y1:
                 crop = frame[y1:y2, x1:x2]
                 if crop.size > 0:
-                    crop_160 = cv2.resize(crop, (160, 160))
-                    crop_rgb = cv2.cvtColor(crop_160, cv2.COLOR_BGR2RGB)
+                    crop_resized = cv2.resize(crop, (self.target_size, self.target_size))
+                    crop_rgb = cv2.cvtColor(crop_resized, cv2.COLOR_BGR2RGB)
                     crops.append(crop_rgb)
                     valid_det_indices.append(i)
 
@@ -198,8 +302,10 @@ class EdgeAsyncPipeline:
             ))
 
         online_tracks = self.tracker.update(tracker_dets)
-        active_ids = [t.track_id for t in online_tracks]
-        self.locker.prune_inactive(active_ids)
+        retain_ids = [t.track_id for t in online_tracks] + [t.track_id for t in self.tracker.lost_tracks]
+        self.locker.prune_inactive(retain_ids)
+        for lost_t in self.tracker.lost_tracks:
+            self.locker.coast(lost_t.track_id)
 
         output_targets: List[Dict[str, Any]] = []
         for t in online_tracks:
@@ -250,6 +356,8 @@ class EdgeAsyncPipeline:
                 "bbox": t.bbox,
                 "score": t.score,
                 "locked_age": lock_info["locked_age"],
+                "locked_age_interval": lock_info["locked_age_interval"],
+                "locked_age_interval_idx": lock_info["locked_age_interval_idx"],
                 "locked_gender": lock_info["locked_gender"],
                 "gender_prob": lock_info["gender_prob"],
                 "aleatoric_std": std_val,

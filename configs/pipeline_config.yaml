@@ -24,12 +24,6 @@ ingestion:
       min_age: 16
       max_age: 77
       demographics: "Official ID mugshots, African-American & Caucasian representation"
-    utkface:
-      kaggle_slug: "jangedoo/utkface-new"
-      pattern: "^(\\d+)_([01])_([0-4])_.*"
-      min_age: 0
-      max_age: 116
-      demographics: "5 ethnicity classes, dense child coverage"
     afad:
       kaggle_slug: "lyk1652/afad-full"
       root_folder: "AFAD-Full"
@@ -64,6 +58,37 @@ ingestion:
       tar_files: ["imdb_crop.tar", "wiki_crop.tar"]
       min_face_score: 1.0
       max_second_face_score: 0.5
+    adience:
+      kaggle_slug: "ttungl/adience-benchmark-gender-and-age-classification"
+      fold_files: ["fold_0_data.txt", "fold_1_data.txt", "fold_2_data.txt", "fold_3_data.txt", "fold_4_data.txt"]
+      min_age: 0
+      max_age: 100
+      demographics: "Unfiltered real-world smartphone/Flickr human faces with age intervals and gender"
+    axon_age:
+      kaggle_slug: "trainingdatapro/age-detection-human-faces-18-50-years"
+      min_age: 18
+      max_age: 80
+      demographics: "Real webcam and smartphone selfie human faces with age brackets and gender"
+    megaage_asian:
+      kaggle_slug: "megaage/megaage-asian"
+      min_age: 1
+      max_age: 70
+      demographics: "40,000+ East and Southeast Asian faces with posterior age distributions"
+    lagenda:
+      kaggle_slug: "lagenda/lagenda-age-gender"
+      min_age: 0
+      max_age: 95
+      demographics: "In-the-wild human face benchmark with verified age intervals and gender"
+    cacd:
+      kaggle_slug: "cacd/cross-age-celebrity-dataset"
+      min_age: 14
+      max_age: 62
+      demographics: "Cross-age longitudinal subjects across 10-year spans"
+    aaf:
+      kaggle_slug: "allagefaces/all-age-faces-dataset"
+      min_age: 2
+      max_age: 80
+      demographics: "Balanced age (2-80) and gender human face dataset"
 
 crawler:
   enabled: true
@@ -85,7 +110,7 @@ quota_manager:
   jpeg_quality: 95
 
 quality_filtering:
-  target_resolution: 160
+  target_resolution: 224
   min_face_size: 112
   min_laplacian_var: 100.0
   min_tenengrad: 250.0
@@ -104,6 +129,32 @@ deduplication:
   cross_split_hamming_min: 7
 
 morphometry_ldl:
+  age_paradigm: "fine_grained_3_to_5_year_intervals"
+  num_fine_age_intervals: 23
+  fine_age_intervals:
+    - {name: "0-2", low: 0, high: 2, span_years: 3}
+    - {name: "3-5", low: 3, high: 5, span_years: 3}
+    - {name: "6-8", low: 6, high: 8, span_years: 3}
+    - {name: "9-11", low: 9, high: 11, span_years: 3}
+    - {name: "12-14", low: 12, high: 14, span_years: 3}
+    - {name: "15-17", low: 15, high: 17, span_years: 3}
+    - {name: "18-21", low: 18, high: 21, span_years: 4}
+    - {name: "22-25", low: 22, high: 25, span_years: 4}
+    - {name: "26-30", low: 26, high: 30, span_years: 5}
+    - {name: "31-35", low: 31, high: 35, span_years: 5}
+    - {name: "36-40", low: 36, high: 40, span_years: 5}
+    - {name: "41-45", low: 41, high: 45, span_years: 5}
+    - {name: "46-50", low: 46, high: 50, span_years: 5}
+    - {name: "51-55", low: 51, high: 55, span_years: 5}
+    - {name: "56-60", low: 56, high: 60, span_years: 5}
+    - {name: "61-65", low: 61, high: 65, span_years: 5}
+    - {name: "66-70", low: 66, high: 70, span_years: 5}
+    - {name: "71-75", low: 71, high: 75, span_years: 5}
+    - {name: "76-80", low: 76, high: 80, span_years: 5}
+    - {name: "81-85", low: 81, high: 85, span_years: 5}
+    - {name: "86-90", low: 86, high: 90, span_years: 5}
+    - {name: "91-95", low: 91, high: 95, span_years: 5}
+    - {name: "96-100", low: 96, high: 100, span_years: 5}
   age_cohorts:
     - name: "0-2"
       low: 0.0
@@ -180,3 +231,4 @@ export_packaging:
   license: "CC0-1.0"
   manifest_parquet: "metadata.parquet"
   manifest_csv: "metadata.csv"
+

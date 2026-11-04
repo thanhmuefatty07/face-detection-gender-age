@@ -27,6 +27,9 @@ ARCFACE_CANONICAL_112 = np.array([
 # ArcFace 160x160 scaled reference points
 ARCFACE_CANONICAL_160 = ARCFACE_CANONICAL_112 * (160.0 / 112.0)
 
+# ArcFace 224x224 native ConvNeXt-V2 canonical reference points (exact 2.0x scale of 112x112)
+ARCFACE_CANONICAL_224 = ARCFACE_CANONICAL_112 * 2.0
+
 # Anthropometric 3D Head Model (in mm) - canonical coordinates
 ANTHROPOMETRIC_HEAD_3D = np.array([
     [-25.0, -30.0, -15.0],  # Left eye pupil (above nose)
@@ -96,13 +99,33 @@ def estimate_head_pose_pnp(
 ) -> Tuple[float, float, float]:
     """
     Estimates 3D Head Pose Euler angles (Yaw, Pitch, Roll in degrees) using solvePnP.
-    Includes frontal angle normalization to prevent 180° camera coordinate inversion.
+    Uses canonical 160x160 isotropic frame normalization for off-center/non-160 portraits
+    and frontal angle normalization to prevent off-center translation bias and 180° inversion.
     """
     if landmarks_5 is None or landmarks_5.shape != (5, 2):
         return (0.0, 0.0, 0.0)
 
-    focal_length = float(image_width)
-    center = (image_width / 2.0, image_height / 2.0)
+    image_points = landmarks_5.astype(np.float64)
+    eye_mid = 0.5 * (image_points[0] + image_points[1])
+    mouth_mid = 0.5 * (image_points[3] + image_points[4])
+    iod = float(np.linalg.norm(image_points[1] - image_points[0]))
+    emd = float(np.linalg.norm(mouth_mid - eye_mid))
+    span = math.hypot(iod, emd)
+    if iod < 1.0 or emd < 1.0 or span < 1.5:
+        return (999.0, 999.0, 999.0)
+
+    if int(image_width) != 160 or int(image_height) != 160:
+        canonical_span = 76.890628
+        canonical_mid = np.array([80.037716, 102.774017], dtype=np.float64)
+        cur_mid = 0.5 * (eye_mid + mouth_mid)
+        scale = canonical_span / span
+        image_points = (image_points - cur_mid) * scale + canonical_mid
+        focal_length = 160.0
+        center = (80.0, 80.0)
+    else:
+        focal_length = float(image_width)
+        center = (image_width / 2.0, image_height / 2.0)
+
     camera_matrix = np.array([
         [focal_length, 0.0, center[0]],
         [0.0, focal_length, center[1]],
@@ -110,7 +133,6 @@ def estimate_head_pose_pnp(
     ], dtype=np.float64)
 
     dist_coeffs = np.zeros((4, 1), dtype=np.float64)
-    image_points = landmarks_5.astype(np.float64)
 
     try:
         rvec = np.zeros((3, 1), dtype=np.float64)
@@ -126,7 +148,7 @@ def estimate_head_pose_pnp(
             flags=cv2.SOLVEPNP_ITERATIVE
         )
         if not success:
-            return (0.0, 0.0, 0.0)
+            return (999.0, 999.0, 999.0)
 
         rot_mat, _ = cv2.Rodrigues(rot_vec)
 
@@ -160,7 +182,9 @@ class UmeyamaAligner:
 
     def __init__(self, target_size: int = 160):
         self.target_size = target_size
-        if target_size == 160:
+        if target_size == 224:
+            self.canonical_points = ARCFACE_CANONICAL_224
+        elif target_size == 160:
             self.canonical_points = ARCFACE_CANONICAL_160
         elif target_size == 112:
             self.canonical_points = ARCFACE_CANONICAL_112

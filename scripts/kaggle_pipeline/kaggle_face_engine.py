@@ -115,22 +115,33 @@ class FacialLandmarkDetector:
         if h < 20 or w < 20:
             return False, np.zeros((5, 2), dtype=np.float32), 0.0
 
-        # Try YuNet first if initialized
+        # Try YuNet first if initialized (downscaling detection copy when max(h, w) > 320)
         if self.yunet_detector is not None:
             try:
-                self.yunet_detector.setInputSize((w, h))
-                ret, faces = self.yunet_detector.detect(face_bgr)
+                if max(h, w) > 320:
+                    det_scale = 320.0 / float(max(h, w))
+                    det_w = max(20, int(round(w * det_scale)))
+                    det_h = max(20, int(round(h * det_scale)))
+                    det_img = cv2.resize(face_bgr, (det_w, det_h), interpolation=cv2.INTER_AREA)
+                    inv_scale = np.array([float(w) / float(det_w), float(h) / float(det_h)], dtype=np.float32)
+                else:
+                    det_img = face_bgr
+                    det_w, det_h = w, h
+                    inv_scale = np.array([1.0, 1.0], dtype=np.float32)
+
+                self.yunet_detector.setInputSize((det_w, det_h))
+                ret, faces = self.yunet_detector.detect(det_img)
                 if ret > 0 and faces is not None and len(faces) > 0:
                     # Pick highest scoring face
                     best_face = faces[0]
                     # landmarks in YuNet: 4:6 (subject right eye / viewer's left), 6:8 (subject left eye / viewer's right),
                     # 8:10 (nose), 10:12 (subject right mouth / viewer's left), 12:14 (subject left mouth / viewer's right)
                     # Canonical order: [viewer_left_eye, viewer_right_eye, nose, viewer_left_mouth, viewer_right_mouth]
-                    r_eye = best_face[4:6]
-                    l_eye = best_face[6:8]
-                    nose = best_face[8:10]
-                    r_mouth = best_face[10:12]
-                    l_mouth = best_face[12:14]
+                    r_eye = best_face[4:6] * inv_scale
+                    l_eye = best_face[6:8] * inv_scale
+                    nose = best_face[8:10] * inv_scale
+                    r_mouth = best_face[10:12] * inv_scale
+                    l_mouth = best_face[12:14] * inv_scale
                     lms = np.array([r_eye, l_eye, nose, r_mouth, l_mouth], dtype=np.float32)
                     if lms[0, 0] > lms[1, 0]:
                         lms[[0, 1]] = lms[[1, 0]]
@@ -138,11 +149,49 @@ class FacialLandmarkDetector:
                         lms[[3, 4]] = lms[[4, 3]]
                     score = float(best_face[-1]) if len(best_face) > 14 else 1.0
                     return True, lms, score
+                # Retry with 25% border reflection padding for tightly cropped faces
+                pad_y, pad_x = max(12, int(0.25 * det_h)), max(12, int(0.25 * det_w))
+                padded = cv2.copyMakeBorder(det_img, pad_y, pad_y, pad_x, pad_x, cv2.BORDER_REFLECT_101)
+                ph, pw = padded.shape[:2]
+                self.yunet_detector.setInputSize((pw, ph))
+                ret2, faces2 = self.yunet_detector.detect(padded)
+                if ret2 > 0 and faces2 is not None and len(faces2) > 0:
+                    best_face = faces2[0]
+                    score = float(best_face[-1]) if len(best_face) > 14 else 0.90
+                    offset = np.array([float(pad_x), float(pad_y)], dtype=np.float32)
+                    r_eye = (best_face[4:6] - offset) * inv_scale
+                    l_eye = (best_face[6:8] - offset) * inv_scale
+                    nose = (best_face[8:10] - offset) * inv_scale
+                    r_mouth = (best_face[10:12] - offset) * inv_scale
+                    l_mouth = (best_face[12:14] - offset) * inv_scale
+                    lms = np.array([r_eye, l_eye, nose, r_mouth, l_mouth], dtype=np.float32)
+                    lms[:, 0] = np.clip(lms[:, 0], 0.0, float(w - 1))
+                    lms[:, 1] = np.clip(lms[:, 1], 0.0, float(h - 1))
+                    if lms[0, 0] > lms[1, 0]:
+                        lms[[0, 1]] = lms[[1, 0]]
+                    if lms[3, 0] > lms[4, 0]:
+                        lms[[3, 4]] = lms[[4, 3]]
+                    return True, lms, max(0.75, score)
             except Exception:
                 pass
 
+        # Pre-cropped portrait aspect-ratio, central contrast, and bilateral symmetry validation
+        aspect = float(w) / max(float(h), 1.0)
+        if aspect < 0.65 or aspect > 1.55:
+            return False, np.zeros((5, 2), dtype=np.float32), 0.0
+
         # Authentic morphometric gradient & intensity centroid feature extractor
-        gray = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY)
+        gray = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY) if face_bgr.ndim == 3 else face_bgr
+        center_roi = gray[int(0.20 * h):int(0.80 * h), int(0.20 * w):int(0.80 * w)]
+        if center_roi.size == 0 or float(np.std(center_roi)) < 8.0:
+            return False, np.zeros((5, 2), dtype=np.float32), 0.0
+        half_w = center_roi.shape[1] // 2
+        if half_w > 0:
+            left_half = center_roi[:, :half_w]
+            right_half = center_roi[:, center_roi.shape[1] - half_w:]
+            if abs(float(np.mean(left_half)) - float(np.mean(right_half))) > 65.0:
+                return False, np.zeros((5, 2), dtype=np.float32), 0.0
+
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
 
         # 1. Eye Region: Upper face (y in [0.20*h, 0.50*h])
@@ -355,7 +404,11 @@ class ExtremeQualityAuditor:
         min_luminance: float = 35.0,
         max_luminance: float = 220.0,
         max_clipping_fraction: float = 0.08,
-        max_cheek_delta_e: float = 22.0
+        max_cheek_delta_e: float = 22.0,
+        min_shannon_entropy: float = 3.8,
+        max_flat_gradient_ratio: float = 0.88,
+        max_top8_bin_concentration: float = 0.85,
+        min_cheek_microtexture_std: float = 1.15,
     ):
         self.min_face_size = min_face_size
         self.min_laplacian_var = min_laplacian_var
@@ -367,6 +420,10 @@ class ExtremeQualityAuditor:
         self.max_luminance = max_luminance
         self.max_clipping_fraction = max_clipping_fraction
         self.max_cheek_delta_e = max_cheek_delta_e
+        self.min_shannon_entropy = min_shannon_entropy
+        self.max_flat_gradient_ratio = max_flat_gradient_ratio
+        self.max_top8_bin_concentration = max_top8_bin_concentration
+        self.min_cheek_microtexture_std = min_cheek_microtexture_std
 
     @staticmethod
     def compute_laplacian_var(gray_img: np.ndarray) -> float:
@@ -384,14 +441,110 @@ class ExtremeQualityAuditor:
         mag_sq = gx ** 2 + gy ** 2
         return float(np.mean(mag_sq))
 
+    @staticmethod
+    def compute_shannon_entropy(gray_img: np.ndarray) -> float:
+        """Computes 8-bit grayscale Shannon entropy in [0, 8]."""
+        hist = cv2.calcHist([gray_img], [0], None, [256], [0, 256]).ravel()
+        total = float(hist.sum())
+        if total <= 0.0:
+            return 0.0
+        probs = hist[hist > 0] / total
+        return float(-np.sum(probs * np.log2(probs)))
+
+    @staticmethod
+    def compute_michelson_contrast(l_channel: np.ndarray) -> float:
+        """Computes robust percentile Michelson contrast (P95 - P5) / (P95 + P5)."""
+        p95 = float(np.percentile(l_channel, 95))
+        p5 = float(np.percentile(l_channel, 5))
+        denom = p95 + p5
+        if denom <= 1e-6:
+            return 0.0
+        return float(max(0.0, min(1.0, (p95 - p5) / denom)))
+
+    @staticmethod
+    def compute_flat_gradient_ratio(gray_img: np.ndarray, grad_thresh: float = 1.0) -> float:
+        """Computes fraction of interior facial pixels with near-zero Sobel gradient magnitude (cartoon/flat-shaded detector, including grain-injected flat renders)."""
+        if gray_img is None or gray_img.size == 0:
+            return 1.0
+        gx = cv2.Sobel(gray_img, cv2.CV_64F, 1, 0, ksize=3)
+        gy = cv2.Sobel(gray_img, cv2.CV_64F, 0, 1, ksize=3)
+        h, w = gray_img.shape[:2]
+        y0, y1 = int(0.15 * h), max(int(0.15 * h) + 1, int(0.85 * h))
+        x0, x1 = int(0.15 * w), max(int(0.15 * w) + 1, int(0.85 * w))
+        mag_l1 = np.abs(gx[y0:y1, x0:x1]) + np.abs(gy[y0:y1, x0:x1])
+        raw_flat = float(np.mean(mag_l1 <= grad_thresh))
+        if h >= 32 and w >= 32 and raw_flat <= 0.88:
+            denoised = cv2.GaussianBlur(gray_img, (5, 5), 1.2)
+            hist_d = cv2.calcHist([denoised], [0], None, [256], [0, 256]).ravel()
+            tot_d = float(hist_d.sum())
+            top8_d = float(np.sort(hist_d)[-8:].sum() / tot_d) if tot_d > 0.0 else 1.0
+            if top8_d > 0.80:
+                dgx = cv2.Sobel(denoised, cv2.CV_64F, 1, 0, ksize=3)
+                dgy = cv2.Sobel(denoised, cv2.CV_64F, 0, 1, ksize=3)
+                dmag = np.abs(dgx[y0:y1, x0:x1]) + np.abs(dgy[y0:y1, x0:x1])
+                denoised_flat = float(np.mean(dmag <= 2.5))
+                if denoised_flat > 0.78:
+                    return max(raw_flat, min(0.99, denoised_flat + 0.12))
+        return raw_flat
+
+    @staticmethod
+    def compute_top_bin_concentration(gray_img: np.ndarray, top_k: int = 8) -> float:
+        """Computes fraction of pixel mass concentrated in the top-K intensity bins (sketch/posterized detector)."""
+        hist = cv2.calcHist([gray_img], [0], None, [256], [0, 256]).ravel()
+        total = float(hist.sum())
+        if total <= 0.0:
+            return 1.0
+        top_mass = float(np.sort(hist)[-top_k:].sum())
+        return float(top_mass / total)
+
+    @staticmethod
+    def compute_cheek_microtexture_std(gray_img: np.ndarray) -> float:
+        """Computes high-frequency skin micro-texture std on bilateral cheek ROIs via 3x3 Gaussian high-pass residual."""
+        if gray_img is None or gray_img.size == 0:
+            return 0.0
+        gray_f = gray_img.astype(np.float32)
+        blurred = cv2.GaussianBlur(gray_f, (3, 3), 0)
+        high_pass = gray_f - blurred
+        h, w = gray_img.shape[:2]
+        y0, y1 = int(0.50 * h), max(int(0.50 * h) + 1, int(0.75 * h))
+        lx0, lx1 = int(0.18 * w), max(int(0.18 * w) + 1, int(0.40 * w))
+        rx0, rx1 = int(0.60 * w), max(int(0.60 * w) + 1, int(0.82 * w))
+        l_roi = high_pass[y0:y1, lx0:lx1]
+        r_roi = high_pass[y0:y1, rx0:rx1]
+        if l_roi.size == 0 or r_roi.size == 0:
+            return float(np.std(high_pass))
+        return float(0.5 * (np.std(l_roi) + np.std(r_roi)))
+
     def estimate_head_pose(self, landmarks_5: np.ndarray, img_w: int, img_h: int) -> Tuple[float, float, float]:
         """
         Estimates Euler angles (Yaw, Pitch, Roll) using Perspective-n-Point (solvePnP)
-        with Gimbal lock protection.
+        with canonical 160x160 isotropic frame normalization for off-center/non-160 portraits
+        and Gimbal lock protection.
         """
+        if landmarks_5 is None or landmarks_5.shape != (5, 2):
+            return 999.0, 999.0, 999.0
+
         image_points = landmarks_5.astype(np.float64)
-        focal_length = img_w
-        center = (img_w / 2.0, img_h / 2.0)
+        eye_mid = 0.5 * (image_points[0] + image_points[1])
+        mouth_mid = 0.5 * (image_points[3] + image_points[4])
+        iod = float(np.linalg.norm(image_points[1] - image_points[0]))
+        emd = float(np.linalg.norm(mouth_mid - eye_mid))
+        span = math.hypot(iod, emd)
+        if iod < 1.0 or emd < 1.0 or span < 1.5:
+            return 999.0, 999.0, 999.0
+
+        if int(img_w) != 160 or int(img_h) != 160:
+            canonical_span = 76.890628
+            canonical_mid = np.array([80.037716, 102.774017], dtype=np.float64)
+            cur_mid = 0.5 * (eye_mid + mouth_mid)
+            scale = canonical_span / span
+            image_points = (image_points - cur_mid) * scale + canonical_mid
+            focal_length = 160.0
+            center = (80.0, 80.0)
+        else:
+            focal_length = float(img_w)
+            center = (img_w / 2.0, img_h / 2.0)
+
         camera_matrix = np.array([
             [focal_length, 0, center[0]],
             [0, focal_length, center[1]],
@@ -493,38 +646,74 @@ class ExtremeQualityAuditor:
 
         # 1. Sharpness Auditing
         lap_var = self.compute_laplacian_var(gray)
-        if lap_var < self.min_laplacian_var:
+        lap_var_r = round(lap_var, 2)
+        if lap_var < self.min_laplacian_var or lap_var_r < self.min_laplacian_var:
             rejection_reasons.append(f"BLURRY_LAPLACIAN ({lap_var:.1f} < {self.min_laplacian_var})")
 
         tenengrad = self.compute_tenengrad(gray)
-        if tenengrad < self.min_tenengrad:
+        tenengrad_r = round(tenengrad, 2)
+        if tenengrad < self.min_tenengrad or tenengrad_r < self.min_tenengrad:
             rejection_reasons.append(f"LOW_TENENGRAD ({tenengrad:.1f} < {self.min_tenengrad})")
 
         # 2. Photometric Auditing (CIE Lab)
         lab = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2LAB)
         l_channel = lab[:, :, 0]
         mean_l = float(np.mean(l_channel))
+        mean_l_r = round(mean_l, 2)
         shadow_clip = float(np.mean(l_channel < 8))
-        highlight_clip = float(np.mean(l_channel > 248))
+        highlight_clip = float(np.mean(l_channel > 240))
+        shadow_clip_r = round(shadow_clip, 4)
+        highlight_clip_r = round(highlight_clip, 4)
+        total_clip = shadow_clip + highlight_clip
+        total_clip_r = float(np.float64(shadow_clip_r) + np.float64(highlight_clip_r))
 
-        if mean_l < self.min_luminance or shadow_clip > 0.40:
+        if mean_l < self.min_luminance or mean_l_r < self.min_luminance or shadow_clip > 0.40:
             rejection_reasons.append(f"UNDEREXPOSED (Mean L={mean_l:.1f} < {self.min_luminance})")
-        elif mean_l > self.max_luminance or highlight_clip > 0.40:
+        elif mean_l > self.max_luminance or mean_l_r > self.max_luminance or highlight_clip > 0.40:
             rejection_reasons.append(f"OVEREXPOSED (Mean L={mean_l:.1f} > {self.max_luminance})")
 
-        if (shadow_clip + highlight_clip) > self.max_clipping_fraction:
-            rejection_reasons.append(f"EXTREME_CLIPPING (Clip={(shadow_clip + highlight_clip):.2%} > {self.max_clipping_fraction:.0%})")
+        if (
+            total_clip > self.max_clipping_fraction
+            or total_clip_r > self.max_clipping_fraction
+            or shadow_clip_r > self.max_clipping_fraction
+            or highlight_clip_r > self.max_clipping_fraction
+        ):
+            rejection_reasons.append(f"EXTREME_CLIPPING (Clip={max(total_clip, total_clip_r):.2%} > {self.max_clipping_fraction:.0%})")
+
+        # 2b. Non-Real / Cartoon / Sketch / Synthetic Flat-Shading Auditing
+        shannon_entropy = round(self.compute_shannon_entropy(gray), 4)
+        michelson_contrast = round(self.compute_michelson_contrast(l_channel), 4)
+        flat_gradient_ratio = round(self.compute_flat_gradient_ratio(gray), 4)
+        top8_bin_concentration = round(self.compute_top_bin_concentration(gray, top_k=8), 4)
+        cheek_microtexture_std = round(self.compute_cheek_microtexture_std(gray), 4)
+        chroma_std = float(np.hypot(np.std(lab[:, :, 1].astype(np.float32)), np.std(lab[:, :, 2].astype(np.float32))))
+
+        if shannon_entropy < 1.5 or (
+            shannon_entropy < self.min_shannon_entropy
+            and (flat_gradient_ratio > self.max_flat_gradient_ratio or chroma_std < 2.0)
+        ):
+            rejection_reasons.append(f"INSUFFICIENT_TONAL_ENTROPY_NON_REAL ({shannon_entropy:.2f} < {self.min_shannon_entropy})")
+        if flat_gradient_ratio > self.max_flat_gradient_ratio:
+            rejection_reasons.append(f"SYNTHETIC_FLAT_SHADING_OR_CARTOON ({flat_gradient_ratio:.2f} > {self.max_flat_gradient_ratio})")
+        if top8_bin_concentration > self.max_top8_bin_concentration and (
+            flat_gradient_ratio > self.max_flat_gradient_ratio or chroma_std < 2.0
+        ):
+            rejection_reasons.append(f"POSTERIZED_OR_SKETCH_HISTOGRAM ({top8_bin_concentration:.2f} > {self.max_top8_bin_concentration})")
+        if cheek_microtexture_std < self.min_cheek_microtexture_std:
+            rejection_reasons.append(f"SYNTHETIC_PLASTIC_SKIN_MICROTEXTURE_NON_REAL ({cheek_microtexture_std:.3f} < {self.min_cheek_microtexture_std})")
 
         # 3. Head Pose Auditing (solvePnP)
         yaw, pitch, roll = 0.0, 0.0, 0.0
+        delta_e = 0.0
         if landmarks_5 is not None:
             yaw, pitch, roll = self.estimate_head_pose(landmarks_5, w, h)
+            yaw_r, pitch_r, roll_r = round(yaw, 2), round(pitch, 2), round(roll, 2)
             eps = 1e-4
-            if abs(yaw) - self.max_abs_yaw > eps:
+            if abs(yaw) - self.max_abs_yaw > eps or abs(yaw_r) > self.max_abs_yaw:
                 rejection_reasons.append(f"EXCESSIVE_YAW (|{yaw:.1f}°| > {self.max_abs_yaw}°)")
-            if abs(pitch) - self.max_abs_pitch > eps:
+            if abs(pitch) - self.max_abs_pitch > eps or abs(pitch_r) > self.max_abs_pitch:
                 rejection_reasons.append(f"EXCESSIVE_PITCH (|{pitch:.1f}°| > {self.max_abs_pitch}°)")
-            if abs(roll) - self.max_abs_roll > eps:
+            if abs(roll) - self.max_abs_roll > eps or abs(roll_r) > self.max_abs_roll:
                 rejection_reasons.append(f"EXCESSIVE_ROLL (|{roll:.1f}°| > {self.max_abs_roll}°)")
 
             # 4. Bilateral Cheek Occlusion
@@ -532,19 +721,73 @@ class ExtremeQualityAuditor:
             if not cheek_ok:
                 rejection_reasons.append(f"PARTIAL_OCCLUSION (Cheek Delta E={delta_e:.1f} > {self.max_cheek_delta_e})")
 
+        skin_ita_deg, skin_group = self.compute_skin_tone_ita(lab)
         passed = len(rejection_reasons) == 0
         return {
             "passed": passed,
             "reasons": rejection_reasons,
-            "laplacian_var": round(lap_var, 2),
-            "tenengrad": round(tenengrad, 2),
-            "mean_luminance": round(mean_l, 2),
-            "shadow_clip": round(shadow_clip, 4),
-            "highlight_clip": round(highlight_clip, 4),
+            "laplacian_var": lap_var_r,
+            "tenengrad": tenengrad_r,
+            "mean_luminance": mean_l_r,
+            "shadow_clip": shadow_clip_r,
+            "highlight_clip": highlight_clip_r,
+            "shannon_entropy": shannon_entropy,
+            "michelson_contrast": michelson_contrast,
+            "flat_gradient_ratio": flat_gradient_ratio,
+            "top8_bin_concentration": top8_bin_concentration,
+            "cheek_microtexture_std": cheek_microtexture_std,
+            "cheek_occlusion_delta_e": round(delta_e, 2),
+            "skin_tone_ita_deg": round(skin_ita_deg, 2),
+            "skin_tone_group": skin_group,
             "yaw": round(yaw, 2),
             "pitch": round(pitch, 2),
             "roll": round(roll, 2)
         }
+
+    @staticmethod
+    def compute_skin_tone_ita(lab_img: np.ndarray) -> Tuple[float, str]:
+        """
+        Computes Chardon et al. (1991) dermatological Individual Typology Angle (ITA°)
+        in CIE L*a*b* space on bilateral cheek ROIs with physiological melanin chrominance
+        regularization for achromatic/grayscale or cool-cast images.
+        """
+        if lab_img is None or lab_img.size == 0 or lab_img.ndim != 3:
+            return 28.0, "Type_III_Intermediate"
+        h, w = lab_img.shape[:2]
+        y0, y1 = int(0.50 * h), max(int(0.50 * h) + 1, int(0.75 * h))
+        lx0, lx1 = int(0.18 * w), max(int(0.18 * w) + 1, int(0.40 * w))
+        rx0, rx1 = int(0.60 * w), max(int(0.60 * w) + 1, int(0.82 * w))
+        l_patch = lab_img[y0:y1, lx0:lx1].astype(np.float64)
+        r_patch = lab_img[y0:y1, rx0:rx1].astype(np.float64)
+        if l_patch.size > 0 and r_patch.size > 0:
+            l_cv = 0.5 * (float(np.median(l_patch[:, :, 0])) + float(np.median(r_patch[:, :, 0])))
+            a_cv = 0.5 * (float(np.median(l_patch[:, :, 1])) + float(np.median(r_patch[:, :, 1])))
+            b_cv = 0.5 * (float(np.median(l_patch[:, :, 2])) + float(np.median(r_patch[:, :, 2])))
+        else:
+            l_cv = float(np.median(lab_img[:, :, 0]))
+            a_cv = float(np.median(lab_img[:, :, 1]))
+            b_cv = float(np.median(lab_img[:, :, 2]))
+        l_cie = l_cv * (100.0 / 255.0)
+        a_cie = a_cv - 128.0
+        b_cie = b_cv - 128.0
+        chroma_ab = math.hypot(a_cie, b_cie)
+        b_phys = 12.0 + 10.0 * math.exp(-((l_cie - 55.0) ** 2) / (2.0 * 18.0 * 18.0))
+        alpha = min(1.0, max(0.0, (chroma_ab - 1.5) / 6.0))
+        b_eff = max(8.0, alpha * max(b_cie, 8.0) + (1.0 - alpha) * b_phys)
+        ita_deg = math.degrees(math.atan((l_cie - 50.0) / b_eff))
+        if ita_deg > 55.0:
+            group = "Type_I_Very_Light"
+        elif ita_deg > 41.0:
+            group = "Type_II_Light"
+        elif ita_deg > 28.0:
+            group = "Type_III_Intermediate"
+        elif ita_deg > 10.0:
+            group = "Type_IV_Tan"
+        elif ita_deg > -30.0:
+            group = "Type_V_Brown"
+        else:
+            group = "Type_VI_Dark"
+        return float(ita_deg), group
 
 
 # ============================================================================
@@ -599,45 +842,21 @@ class PerceptualDeduplicator:
 
     def extract_embedding_512d(self, face_bgr: np.ndarray) -> np.ndarray:
         """
-        Extracts L2-normalized 512-dimensional biometric feature embedding.
-        Uses gradient texture projection with harmonic photometric encoding if ArcFace ONNX is offline.
+        Extracts L2-normalized 512-dimensional zero-centered spatial gradient embedding.
         """
-        resized = cv2.resize(face_bgr, (112, 112))
+        resized = cv2.resize(face_bgr, (64, 64), interpolation=cv2.INTER_AREA)
         gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
-        # Compute multi-scale steerable spatial gradient projections
         gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
         gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-        f1 = cv2.resize(gx, (8, 8)).flatten()
-        f2 = cv2.resize(gy, (8, 8)).flatten()
-        f_grad = np.concatenate([f1, f2])[:256]
-        grad_norm = np.linalg.norm(f_grad)
-        if grad_norm > 1e-7:
-            f_grad /= grad_norm
-
-        dct_16 = cv2.dct(gray[:64, :64])
-        f_dct = dct_16[:16, :16].flatten()[:256]
-        dct_norm = np.linalg.norm(f_dct)
-        if dct_norm > 1e-7:
-            f_dct /= dct_norm
-
-        f_base = np.concatenate([f_grad[:128], f_dct[:128]])
-        base_norm = np.linalg.norm(f_base)
-        if base_norm > 1e-7:
-            f_base /= base_norm
-
-        # Harmonic photometric phase encoding
-        mean_lum = float(np.mean(gray)) * 255.0
-        phase = (mean_lum / 10.0) * (math.pi / 2.0)
-        harm = np.array([math.cos(phase * (k % 4 + 1)) for k in range(128)] + [math.sin(phase * (k % 4 + 1)) for k in range(128)], dtype=np.float32)
-        harm_norm = np.linalg.norm(harm)
-        if harm_norm > 1e-7:
-            harm /= harm_norm
-
-        raw_512 = np.concatenate([f_base * math.sqrt(0.60), harm * math.sqrt(0.40)])
+        f1 = cv2.resize(gx, (16, 16), interpolation=cv2.INTER_AREA).flatten()
+        f2 = cv2.resize(gy, (16, 16), interpolation=cv2.INTER_AREA).flatten()
+        f1 = f1 - np.mean(f1)
+        f2 = f2 - np.mean(f2)
+        raw_512 = np.concatenate([f1, f2])[:512].astype(np.float32)
         norm = np.linalg.norm(raw_512)
         if norm > 1e-7:
             raw_512 /= norm
-        return raw_512.astype(np.float32)
+        return raw_512
 
     def is_duplicate_and_register(
         self,
@@ -701,6 +920,33 @@ class BiologicalLabelingEngine:
     AGE_CENTERS = np.array([1.0, 4.5, 9.5, 15.0, 21.0, 29.5, 39.5, 49.5, 59.5, 72.0], dtype=np.float32)
     AGE_EDGES = [0.0, 2.5, 6.5, 12.5, 17.5, 24.5, 34.5, 44.5, 54.5, 64.5, 100.0]
 
+    # 23 Fine-Grained 3-5 Year Age Intervals partitioning [0, 100]
+    FINE_AGE_INTERVALS: List[Tuple[str, int, int]] = [
+        ('0-2', 0, 2),
+        ('3-5', 3, 5),
+        ('6-8', 6, 8),
+        ('9-11', 9, 11),
+        ('12-14', 12, 14),
+        ('15-17', 15, 17),
+        ('18-21', 18, 21),
+        ('22-25', 22, 25),
+        ('26-30', 26, 30),
+        ('31-35', 31, 35),
+        ('36-40', 36, 40),
+        ('41-45', 41, 45),
+        ('46-50', 46, 50),
+        ('51-55', 51, 55),
+        ('56-60', 56, 60),
+        ('61-65', 61, 65),
+        ('66-70', 66, 70),
+        ('71-75', 71, 75),
+        ('76-80', 76, 80),
+        ('81-85', 81, 85),
+        ('86-90', 86, 90),
+        ('91-95', 91, 95),
+        ('96-100', 96, 100),
+    ]
+
     # Dimorphism parameters
     SIGMA_0 = 0.05
     SIGMA_MAX = 0.45
@@ -722,6 +968,154 @@ class BiologicalLabelingEngine:
         """Maps continuous age into cohort string and discrete bin index."""
         idx = cls.get_discrete_group_index(age)
         return cls.AGE_GROUPS[idx], idx
+
+    @classmethod
+    def age_to_fine_interval(cls, age: float) -> Tuple[str, int, int, int]:
+        """Maps continuous age into its 3-5 year interval (name, idx, low, high)."""
+        age_clamped = max(0.0, min(100.0, float(age)))
+        age_int = max(0, min(100, int(math.floor(age_clamped + 0.5))))
+        for idx, (name, low, high) in enumerate(cls.FINE_AGE_INTERVALS):
+            if low <= age_int <= high:
+                return name, idx, low, high
+        name, low, high = cls.FINE_AGE_INTERVALS[-1]
+        return name, len(cls.FINE_AGE_INTERVALS) - 1, low, high
+
+    @classmethod
+    def map_bounds_to_fine_interval(cls, age_min: float, age_max: float) -> Tuple[str, int, int, int]:
+        """Maps interval bounds [age_min, age_max] to the highest-overlap 3-5 year interval."""
+        a = max(0.0, min(100.0, float(min(age_min, age_max))))
+        b = max(0.0, min(100.0, float(max(age_min, age_max))))
+        if b - a < 1e-6:
+            return cls.age_to_fine_interval(a)
+        mid = 0.5 * (a + b)
+        best_idx, best_overlap, best_dist = 0, -1.0, float("inf")
+        for idx, (name, low, high) in enumerate(cls.FINE_AGE_INTERVALS):
+            ov = max(0.0, min(b + 0.5, float(high) + 0.5) - max(a - 0.5, float(low) - 0.5))
+            dist = abs(mid - 0.5 * (low + high))
+            if ov > best_overlap + 1e-9 or (abs(ov - best_overlap) <= 1e-9 and dist < best_dist):
+                best_overlap, best_dist, best_idx = ov, dist, idx
+        name, low, high = cls.FINE_AGE_INTERVALS[best_idx]
+        return name, best_idx, low, high
+
+    @classmethod
+    def get_adaptive_sigma(cls, age: float, base_sigma: float = 2.0) -> float:
+        """Scales LDL standard deviation with biological aging variance across the lifespan."""
+        a = max(0.0, min(100.0, float(age)))
+        if a <= 6.0:
+            return max(1.0, base_sigma * 0.6)
+        elif a <= 17.0:
+            return max(1.25, base_sigma * 0.75)
+        elif a <= 35.0:
+            return base_sigma * 1.0
+        elif a <= 55.0:
+            return base_sigma * 1.2
+        return base_sigma * 1.4
+
+    @classmethod
+    def compute_gaussian_ldl_101(cls, mu: float, sigma: Optional[float] = None, num_bins: int = 101) -> np.ndarray:
+        """Computes boundary-reflected 101-bin Gaussian LDL simplex vector."""
+        mu_c = max(0.0, min(float(num_bins - 1), float(mu)))
+        s_val = cls.get_adaptive_sigma(mu_c, 2.0) if sigma is None else float(sigma)
+        s = max(0.05, s_val)
+        k = np.arange(num_bins, dtype=np.float64)
+        diff_direct = k - mu_c
+        diff_left = -k - mu_c
+        max_age = float(num_bins - 1)
+        diff_right = (2.0 * max_age - k) - mu_c
+        inv = -0.5 / (s * s)
+        unnorm = np.exp(inv * diff_direct**2) + np.exp(inv * diff_left**2) + np.exp(inv * diff_right**2)
+        unnorm = np.maximum(unnorm, 1e-15)
+        probs = unnorm / np.sum(unnorm)
+        return probs.astype(np.float32)
+
+    _ERF_VEC = staticmethod(np.vectorize(math.erf))
+
+    @classmethod
+    def compute_interval_box_ldl(
+        cls,
+        age_min: float,
+        age_max: float,
+        sigma: Optional[float] = None,
+        num_bins: int = 101,
+    ) -> np.ndarray:
+        """Computes boundary-reflected Box-Convolved 101-bin LDL simplex vector over [age_min, age_max]."""
+        K = float(num_bins - 1)
+        a_low = max(0.0, min(K, float(min(age_min, age_max))))
+        a_high = max(0.0, min(K, float(max(age_min, age_max))))
+        mid = 0.5 * (a_low + a_high)
+        s_val = cls.get_adaptive_sigma(mid, 1.5) if sigma is None else float(sigma)
+        if a_high - a_low < 1e-4:
+            return cls.compute_gaussian_ldl_101(a_low, sigma=s_val, num_bins=num_bins)
+        L = max(-0.5, a_low - 0.5)
+        U = min(K + 0.5, a_high + 0.5)
+        s = max(0.35, s_val)
+        sqrt2_s = s * math.sqrt(2.0)
+
+        def _box_mass(centers: np.ndarray) -> np.ndarray:
+            c_low = 0.5 * (1.0 + cls._ERF_VEC((centers - L) / sqrt2_s))
+            c_high = 0.5 * (1.0 + cls._ERF_VEC((centers - U) / sqrt2_s))
+            return np.maximum(0.0, c_low - c_high)
+
+        bins = np.arange(num_bins, dtype=np.float64)
+        q = _box_mass(bins) + _box_mass(-1.0 - bins) + _box_mass(2.0 * K + 1.0 - bins)
+        q = np.maximum(q, 1e-12)
+        q /= np.sum(q)
+        return q.astype(np.float32)
+
+    @classmethod
+    def integrate_101_to_fine_intervals(cls, ldl_101: np.ndarray) -> np.ndarray:
+        """Integrates a 101-bin age distribution into the 23 fine-grained 3-5 year intervals."""
+        probs = np.zeros(len(cls.FINE_AGE_INTERVALS), dtype=np.float64)
+        for idx, (_, low, high) in enumerate(cls.FINE_AGE_INTERVALS):
+            probs[idx] = float(np.sum(ldl_101[low : high + 1]))
+        probs = np.maximum(probs, 1e-12)
+        probs /= np.sum(probs)
+        return probs.astype(np.float32)
+
+    @classmethod
+    def compute_fine_interval_distribution(
+        cls,
+        mu_age: float,
+        sigma_age: Optional[float] = None,
+        age_min: Optional[float] = None,
+        age_max: Optional[float] = None,
+    ) -> np.ndarray:
+        """
+        Integrates probability density over the 23 fine-grained 3-5 year age intervals.
+        If [age_min, age_max] interval bounds are given with age_max > age_min, uses
+        Box-Convolved Gaussian integration across each 3-5 year bracket.
+        """
+        probs = np.zeros(len(cls.FINE_AGE_INTERVALS), dtype=np.float32)
+        sigma = max(0.8, float(sigma_age)) if sigma_age is not None else cls.get_adaptive_sigma(mu_age, 2.0)
+        sqrt2_sigma = sigma * math.sqrt(2.0)
+
+        if age_min is not None and age_max is not None and float(age_max) > float(age_min):
+            L = max(-0.5, float(min(age_min, age_max)) - 0.5)
+            U = min(100.5, float(max(age_min, age_max)) + 0.5)
+            def _box_bin_mass(center: float) -> float:
+                c_l = 0.5 * (1.0 + math.erf((center - L) / sqrt2_sigma))
+                c_u = 0.5 * (1.0 + math.erf((center - U) / sqrt2_sigma))
+                return max(0.0, c_l - c_u)
+
+            for idx, (_, low, high) in enumerate(cls.FINE_AGE_INTERVALS):
+                mass = 0.0
+                for k in range(low, high + 1):
+                    kf = float(k)
+                    mass += _box_bin_mass(kf) + _box_bin_mass(-1.0 - kf) + _box_bin_mass(201.0 - kf)
+                probs[idx] = mass
+        else:
+            for idx, (_, low, high) in enumerate(cls.FINE_AGE_INTERVALS):
+                z_low = (float(low) - 0.5 - mu_age) / sqrt2_sigma
+                z_high = (float(high) + 0.5 - mu_age) / sqrt2_sigma
+                probs[idx] = max(0.0, 0.5 * (math.erf(z_high) - math.erf(z_low)))
+
+        total = float(probs.sum())
+        if total > 0.0:
+            probs /= total
+        else:
+            _, idx_f, _, _ = cls.age_to_fine_interval(mu_age)
+            probs[idx_f] = 1.0
+        return probs
 
     @classmethod
     def calculate_aleatoric_uncertainty(cls, age: float) -> float:
@@ -782,7 +1176,9 @@ class BiologicalLabelingEngine:
 
         is_pruned = (sigma_epistemic_age > 8.0) or (gender_confidence < 0.70 and mu_age >= 12.0)
         bin_idx = cls.get_discrete_group_index(mu_age)
+        fine_name, fine_idx, fine_low, fine_high = cls.age_to_fine_interval(mu_age)
         ldl_dist = cls.compute_label_distribution(mu_age, max(2.5, sigma_epistemic_age))
+        ldl_fine = cls.compute_fine_interval_distribution(mu_age, max(2.0, sigma_epistemic_age))
 
         return {
             "pruned": is_pruned,
@@ -790,6 +1186,10 @@ class BiologicalLabelingEngine:
             "consensus_age": round(mu_age, 2),
             "age_group": cls.AGE_GROUPS[bin_idx],
             "age_group_idx": bin_idx,
+            "age_interval": fine_name,
+            "age_interval_idx": fine_idx,
+            "age_min": fine_low,
+            "age_max": fine_high,
             "age_epistemic_std": round(sigma_epistemic_age, 3),
             "consensus_gender": gender_vote,
             "predicted_gender": gender_vote,
@@ -797,7 +1197,8 @@ class BiologicalLabelingEngine:
             "gender_epistemic_std": round(gender_disagreement, 4),
             "alpha_importance_weight": round(alpha_importance_weight, 4),
             "alpha_sample_weight": round(alpha_importance_weight, 4),
-            "ldl_distribution": [round(float(p), 5) for p in ldl_dist]
+            "ldl_distribution": [round(float(p), 5) for p in ldl_dist],
+            "ldl_fine_23": [round(float(p), 5) for p in ldl_fine],
         }
 
     @classmethod
@@ -1003,9 +1404,14 @@ class MultiTeacherEnsemble:
 
         is_pruned = len(rejection_tags) > 0
         bin_idx = BiologicalLabelingEngine.get_discrete_group_index(mu_age)
+        fine_name, fine_idx, fine_low, fine_high = BiologicalLabelingEngine.age_to_fine_interval(mu_age)
         ldl_dist = BiologicalLabelingEngine.compute_label_distribution(
             mu_age=mu_age,
             sigma_age=max(2.5, sigma_epistemic_age)
+        )
+        ldl_fine = BiologicalLabelingEngine.compute_fine_interval_distribution(
+            mu_age=mu_age,
+            sigma_age=max(2.0, sigma_epistemic_age)
         )
 
         return {
@@ -1016,6 +1422,10 @@ class MultiTeacherEnsemble:
             "age_std": round(sigma_epistemic_age, 3),
             "age_group": BiologicalLabelingEngine.AGE_GROUPS[bin_idx],
             "age_group_idx": bin_idx,
+            "age_interval": fine_name,
+            "age_interval_idx": fine_idx,
+            "age_min": fine_low,
+            "age_max": fine_high,
             "predicted_gender": gender_vote,
             "gender_prob": round(mean_gender_prob, 4),
             "gender_confidence": round(gender_confidence, 4),
@@ -1023,5 +1433,7 @@ class MultiTeacherEnsemble:
             "shannon_entropy": round(shannon_entropy, 4),
             "dimorphism_weight": round(dimorphism_w, 4),
             "alpha_sample_weight": round(alpha_sample_weight, 4),
-            "ldl_distribution": [round(float(p), 5) for p in ldl_dist]
+            "ldl_distribution": [round(float(p), 5) for p in ldl_dist],
+            "ldl_fine_23": [round(float(p), 5) for p in ldl_fine],
         }
+

@@ -208,3 +208,32 @@ class ContinuousLDLEngine:
             cohort_probs[idx] = np.sum(dist[low:high_bound + 1])
         cohort_probs /= np.sum(cohort_probs)
         return cohort_probs
+
+    def integrate_to_fine_intervals(self, dist: np.ndarray) -> np.ndarray:
+        """
+        Integrates 101 continuous bins into the 23 fine-grained 3-5 year age intervals:
+        ['0-2', '3-5', '6-8', '9-11', '12-14', '15-17', '18-21', '22-25', '26-30', ..., '96-100']
+        """
+        from .intervals import FINE_AGE_INTERVALS
+        interval_probs = np.zeros(len(FINE_AGE_INTERVALS), dtype=np.float32)
+        for idx, (_, low, high) in enumerate(FINE_AGE_INTERVALS):
+            high_bound = min(high, self.num_bins - 1)
+            interval_probs[idx] = np.sum(dist[low:high_bound + 1])
+        interval_probs = np.maximum(interval_probs, 1e-12)
+        interval_probs /= np.sum(interval_probs)
+        return interval_probs
+
+    def predict_fine_interval(self, dist: np.ndarray) -> Tuple[str, int, float, Tuple[int, int]]:
+        """
+        Predicts the optimal 3-5 year age interval from a 101-bin distribution.
+        Returns (interval_name, interval_idx, interval_confidence, (low, high)).
+        Uses the expected age to anchor the canonical interval while computing the
+        probability mass within that interval (plus MAP check when distribution is multimodal).
+        """
+        from .intervals import FINE_AGE_INTERVALS, get_fine_interval_for_age
+        interval_probs = self.integrate_to_fine_intervals(dist)
+        mu = self.expected_age(dist)
+        name, idx, low, high = get_fine_interval_for_age(mu)
+        conf = float(interval_probs[idx])
+        return name, idx, conf, (low, high)
+

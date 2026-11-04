@@ -1,5 +1,5 @@
 {
-  "id": "vnthanhphm/face-dataset-mining-extreme-filtering-pipeline",
+  "id": "thanhmuefatty/face-dataset-mining-extreme-filtering-pipeline",
   "title": "Face Dataset Mining Extreme Filtering Pipeline",
   "code_file": "kaggle_face_mining_pipeline.ipynb",
   "language": "python",
@@ -11,11 +11,20 @@
   "dataset_sources": [
     "nitingandhi/agedb-database",
     "chiragsaipanuganti/morph",
-    "jangedoo/utkface-new",
     "lyk1652/afad-full",
-    "vnthanhphm/appa-real-age-only-v1",
+    "beatrizmimosagarca/appa-real-dsb05rt",
+    "abhikjha/appa-real-face-cropped",
     "pdombrza/fgnet-gendered",
-    "moritzm00/biometrically-filtered-famous-figure-dataset"
+    "moritzm00/biometrically-filtered-famous-figure-dataset",
+    "axondata/face-recognition-age-estimation-dataset",
+    "trainingdatapro/age-detection-human-faces-18-60-years",
+    "ghaidaalatoum/fairface",
+    "ttungl/adience-benchmark-gender-and-age-classification",
+    "baopmessi/megaage",
+    "maiabboud/lagenda",
+    "pdombrza/cacd-filtered-dataset",
+    "yuulind/imdb-clean",
+    "medrinemoringa/wiki-crop"
   ],
   "competition_sources": [],
   "kernel_sources": []

@@ -16,6 +16,7 @@ from typing import List, Dict, Any, Optional, Tuple, Union, Generator
 import cv2
 import numpy as np
 
+from src.biometrics.core.geometry import UmeyamaAligner
 from src.biometrics.tracking.byte_tracker import ByteTracker, Detection, STrack
 from src.biometrics.tracking.target_locker import TargetLocker
 from src.biometrics.detection.yunet_detector import YuNetFaceDetector
@@ -34,15 +35,18 @@ class CloudInferenceClient:
         track_thresh: float = 0.6,
         low_thresh: float = 0.2,
         yunet_model_path: Optional[str | Path] = None,
+        target_size: int = 160,
     ):
         self.server_url = server_url
         self.max_targets = max_targets
+        self.target_size = int(target_size)
         self.tracker = ByteTracker(
             track_thresh=track_thresh,
             low_thresh=low_thresh,
             max_targets=max_targets,
         )
         self.locker = TargetLocker()
+        self.aligner = UmeyamaAligner(target_size=self.target_size)
 
         # Initialize YuNet Face Detector
         if yunet_model_path is None:
@@ -56,13 +60,15 @@ class CloudInferenceClient:
 
     def detect_faces(self, frame: np.ndarray) -> List[Dict[str, Any]]:
         """
-        Detects faces in frame using YuNet and extracts 160x160 aligned crops.
+        Detects faces in frame using YuNet and extracts aligned crops (224x224 or 160x160).
         
         Args:
             frame: (H, W, 3) BGR image
         Returns:
-            List of detection dicts with 'bbox', 'score', and 'crop' (160x160)
+            List of detection dicts with 'bbox', 'score', and 'crop'
         """
+        if frame is None or frame.size == 0 or frame.ndim != 3:
+            return []
         H, W = frame.shape[:2]
         if H < 20 or W < 20:
             return []
@@ -75,13 +81,24 @@ class CloudInferenceClient:
             x2 = min(W, int(d.bbox.x + d.bbox.width))
             y2 = min(H, int(d.bbox.y + d.bbox.height))
             if x2 > x1 and y2 > y1:
-                crop = frame[y1:y2, x1:x2]
-                if crop.size > 0:
-                    crop_160 = cv2.resize(crop, (160, 160))
+                crop_aligned = None
+                lmks_obj = getattr(d, "landmarks", None)
+                if lmks_obj is not None:
+                    try:
+                        lmks_pts = lmks_obj.points if hasattr(lmks_obj, "points") else np.asarray(lmks_obj, dtype=np.float32)
+                        if lmks_pts.shape == (5, 2) and np.all(np.isfinite(lmks_pts)):
+                            crop_aligned = self.aligner.align(frame, lmks_pts)
+                    except Exception:
+                        crop_aligned = None
+                if crop_aligned is None:
+                    crop = frame[y1:y2, x1:x2]
+                    if crop.size > 0:
+                        crop_aligned = cv2.resize(crop, (self.target_size, self.target_size))
+                if crop_aligned is not None:
                     results.append({
                         "bbox": (float(x1), float(y1), float(x2), float(y2)),
                         "score": float(d.bbox.confidence),
-                        "crop": crop_160,
+                        "crop": crop_aligned,
                     })
         return results
 
@@ -122,8 +139,10 @@ class CloudInferenceClient:
             tracker_dets.append(Detection(bbox=bbox, score=score, reid_feat=reid_feat, det_id=i))
 
         online_tracks = self.tracker.update(tracker_dets)
-        active_ids = [t.track_id for t in online_tracks]
-        self.locker.prune_inactive(active_ids)
+        retain_ids = [t.track_id for t in online_tracks] + [t.track_id for t in self.tracker.lost_tracks]
+        self.locker.prune_inactive(retain_ids)
+        for lost_t in self.tracker.lost_tracks:
+            self.locker.coast(lost_t.track_id)
 
         output_targets: List[Dict[str, Any]] = []
         for t in online_tracks:
@@ -175,6 +194,8 @@ class CloudInferenceClient:
                 "bbox": t.bbox,
                 "score": t.score,
                 "locked_age": lock_info["locked_age"],
+                "locked_age_interval": lock_info["locked_age_interval"],
+                "locked_age_interval_idx": lock_info["locked_age_interval_idx"],
                 "locked_gender": lock_info["locked_gender"],
                 "gender_prob": lock_info["gender_prob"],
                 "aleatoric_std": std_pred,
@@ -277,7 +298,9 @@ class CloudInferenceClient:
             cv2.line(hud_img, (x2, y1), (x2, y1 + corner_len), color, 3)
 
             # HUD Label banner
-            label = f"ID #{tid} | {gender} | {age:.1f}y (+/-{std:.1f})"
+            from ..estimation.intervals import get_fine_interval_for_age
+            age_iv = tgt.get("locked_age_interval") or get_fine_interval_for_age(age)[0]
+            label = f"ID #{tid} | {gender} | {age_iv}y ({age:.1f}y +/-{std:.1f})"
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
             cv2.rectangle(hud_img, (x1, max(0, y1 - th - 8)), (x1 + tw + 6, max(0, y1)), color, -1)
             cv2.putText(

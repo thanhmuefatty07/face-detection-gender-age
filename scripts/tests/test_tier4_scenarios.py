@@ -451,4 +451,5 @@ class TestScenarioS6EndToEndPipelineLifecycle:
         report_content = generate_audit_report(manifest_csv, report_file)
         assert report_file.exists()
         assert "Báo Cáo Thẩm Định" in report_content
-        assert "ĐẠT CHUẨN CỰC ĐOAN" in report_content
+        assert "Status: **BLOCKED**" in report_content
+        assert validate_manifest_integrity(df)["passed"] is False

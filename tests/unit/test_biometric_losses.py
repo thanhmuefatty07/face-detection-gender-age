@@ -290,3 +290,114 @@ class TestUnifiedBiometricLoss:
         assert not torch.isnan(age_logits.grad).any()
         assert gender_logits.grad is not None
         assert not torch.isnan(gender_logits.grad).any()
+
+    def test_fine_interval_ldl_and_tikhonov_smoothness_and_photometric_consistency(self):
+        """Verifies fine_interval_ldl_loss, ldl_tikhonov_smoothness_loss, and photometric_consistency_loss."""
+        from src.biometrics.estimation.losses import (
+            fine_interval_ldl_loss,
+            ldl_tikhonov_smoothness_loss,
+            photometric_consistency_loss,
+        )
+
+        # 1. 23-bracket fine interval ordinal loss monotonicity
+        target_23 = torch.zeros(1, 23)
+        target_23[0, 8] = 1.0  # bracket '26-30'
+        pred_close_23 = torch.zeros(1, 23, requires_grad=True)
+        with torch.no_grad():
+            pred_close_23[0, 9] = 1.0
+        pred_far_23 = torch.zeros(1, 23, requires_grad=True)
+        with torch.no_grad():
+            pred_far_23[0, 20] = 1.0
+
+        l_close = fine_interval_ldl_loss(pred_close_23, target_23)
+        l_far = fine_interval_ldl_loss(pred_far_23, target_23)
+        assert l_far.item() > l_close.item()
+        l_close.backward()
+        assert pred_close_23.grad is not None
+
+        # 2. Tikhonov second-order Laplacian smoothness penalty
+        bins = torch.arange(101, dtype=torch.float32)
+        smooth_p = torch.softmax(-0.5 * ((bins - 30.0) / 3.0) ** 2, dim=-1).unsqueeze(0)
+        jagged_logits = torch.tensor([3.0 if i % 2 == 0 else -3.0 for i in range(101)]).unsqueeze(0)
+        jagged_p = torch.softmax(jagged_logits, dim=-1)
+
+        loss_smooth = ldl_tikhonov_smoothness_loss(smooth_p)
+        loss_jagged = ldl_tikhonov_smoothness_loss(jagged_p)
+        assert loss_jagged.item() > 50.0 * loss_smooth.item()
+
+        # 3. Photometric dual-view consistency loss
+        B = 2
+        clean_preds = {
+            "age_probs": torch.softmax(torch.randn(B, 101), dim=-1),
+            "gender_logit": torch.tensor([2.0, -2.0]),
+            "reid_embedding": F.normalize(torch.randn(B, 64), p=2, dim=-1),
+        }
+        # Identical corrupted predictions -> ~0 loss
+        zero_cons = photometric_consistency_loss(clean_preds, clean_preds)
+        assert pytest.approx(zero_cons.item(), abs=1e-5) == 0.0
+
+        corrupt_logits = torch.randn(B, 101, requires_grad=True)
+        corrupt_preds = {
+            "age_probs": torch.softmax(corrupt_logits, dim=-1),
+            "gender_logit": torch.tensor([-1.5, 1.5], requires_grad=True),
+            "reid_embedding": F.normalize(torch.randn(B, 64, requires_grad=True), p=2, dim=-1),
+        }
+        pos_cons = photometric_consistency_loss(clean_preds, corrupt_preds)
+        assert pos_cons.item() > 0.05
+        pos_cons.backward()
+        assert corrupt_logits.grad is not None
+        assert not torch.isnan(corrupt_logits.grad).any()
+
+    def test_photometric_consistency_zero_bin_no_nan_and_clean_detached(self):
+        """Verifies exact zero bins in p_corr do not produce NaN gradients and clean teacher is detached."""
+        from src.biometrics.estimation.losses import photometric_consistency_loss
+
+        p_clean = torch.softmax(torch.randn(2, 101), dim=-1).requires_grad_(True)
+        p_corr = torch.zeros(2, 101)
+        p_corr[:, 30] = 1.0  # 100 exact zero bins per sample!
+        p_corr.requires_grad_(True)
+
+        loss = photometric_consistency_loss({"age_probs": p_clean}, {"age_probs": p_corr})
+        loss.backward()
+
+        assert p_corr.grad is not None
+        assert not torch.isnan(p_corr.grad).any()
+        assert torch.all(torch.isfinite(p_corr.grad))
+        # Clean teacher must NOT receive backward gradients
+        assert p_clean.grad is None or torch.all(p_clean.grad == 0.0)
+
+    def test_unified_loss_supervises_fine_interval_logits_directly(self):
+        """Verifies UnifiedBiometricLoss supervises fine_interval_logits alongside age_interval_probs."""
+        criterion = UnifiedBiometricLoss(weight_fine_23=0.5)
+        B = 2
+        age_logits = torch.randn(B, 101, requires_grad=True)
+        age_probs = torch.softmax(age_logits, dim=-1)
+        expected_age = torch.sum(age_probs * torch.arange(101, dtype=torch.float32), dim=-1)
+        fine_interval_logits = torch.randn(B, 23, requires_grad=True)
+        gender_logits = torch.randn(B, requires_grad=True)
+        log_var = torch.randn(B, requires_grad=True)
+
+        preds = {
+            "age_probs": age_probs,
+            "age_logits": age_logits,
+            "expected_age": expected_age,
+            "fine_interval_logits": fine_interval_logits,
+            "gender_logit": gender_logits,
+            "log_variance": log_var,
+        }
+        targets = {
+            "ldl_101": torch.softmax(torch.randn(B, 101), dim=-1),
+            "ldl_fine_23": torch.softmax(torch.randn(B, 23), dim=-1),
+            "age_continuous": torch.tensor([25.0, 60.0]),
+            "gender": torch.tensor([1.0, 0.0]),
+            "gender_mask": torch.tensor([1.0, 1.0]),
+            "dimorphism_weight": torch.tensor([1.0, 1.0]),
+        }
+
+        total_loss, metrics = criterion(preds, targets)
+        assert metrics["loss_fine_23"] > 0.0
+        total_loss.backward()
+        assert fine_interval_logits.grad is not None
+        assert not torch.all(fine_interval_logits.grad == 0.0)
+
+
